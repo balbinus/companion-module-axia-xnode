@@ -2,6 +2,15 @@ import { Regex, type SomeCompanionConfigField } from '@companion-module/base'
 
 export type MeterMode = 'off' | 'poll' | 'http'
 
+/** Stored in the Companion secrets store, not in the config. */
+export type ModuleSecrets = {
+	password: string
+}
+
+/** Config as stored by Companion (the password lives in the secrets) */
+export type StoredConfig = Omit<ModuleConfig, 'password'>
+
+/** Runtime configuration: the stored config plus the password from the secrets */
 export type ModuleConfig = {
 	host: string
 	port: number
@@ -67,7 +76,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			default: DEFAULT_PORT,
 		},
 		{
-			type: 'textinput',
+			type: 'secret-text',
 			id: 'password',
 			label: 'LWRP password',
 			tooltip: 'Only sent (LOGIN) when a write permission below is enabled. Leave empty if the node has no password.',

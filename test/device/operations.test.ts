@@ -4,7 +4,10 @@ import { LwrpError } from '../../src/device/connection.js'
 import type { WriteTarget, XNodeController } from '../../src/device/controller.js'
 import {
 	COALESCE_MS,
+	DESTROY_RESTORE_TIMEOUT_MS,
 	MIC_GAIN_MAX_TENTHS,
+	PULSE_RESTORE_MAX_ATTEMPTS,
+	PULSE_RESTORE_RETRY_MS,
 	MIC_GAIN_MIN_TENTHS,
 	XNodeOperations,
 	normaliseMicGain,
@@ -237,7 +240,7 @@ describe('connection and permission gating', () => {
 
 	it('refuses after destroy', async () => {
 		const r = rig()
-		r.ops.destroy()
+		await r.ops.destroy()
 		await expect(r.ops.mixSet([[9, 1]], 0)).rejects.toThrow(/shutting down/)
 	})
 })
@@ -684,7 +687,7 @@ describe('mixer: adjust (coalesced)', () => {
 	it('destroy drops pending adjusts without writing and resolves the waiters', async () => {
 		const r = rig()
 		const p = r.ops.mixAdjust([[12, 10]], 10)
-		r.ops.destroy()
+		await r.ops.destroy()
 		await expect(p).resolves.toBeUndefined()
 		await vi.advanceTimersByTimeAsync(200)
 		expect(r.ctl.commands).toEqual([])
@@ -749,8 +752,7 @@ describe('mixer snapshots', () => {
 		expect(r.ctl.commands).toEqual(['MIX 9 1:-800 2:240'])
 	})
 
-	// BUG: a hand-made snapshot gain of -1000 (the wire value for "off") is clamped to the minimum and switches the crosspoint ON
-	it.fails('a gain of -1000 in a snapshot means off, not -80 dB', async () => {
+	it('a gain of -1000 in a snapshot means off, not -80 dB', async () => {
 		const r = rig()
 		await r.ops.mixSnapshotRecall(JSON.stringify({ v: 1, devn: 'axiaxnode.analog4x4', mix: { '9': { '1': -1000 } } }))
 		expect(r.ctl.commands).toEqual([])
@@ -975,13 +977,91 @@ describe('GPO pulse', () => {
 		expect(r.logs.some(([l, m]) => l === 'warn' && /could not restore/.test(m))).toBe(true)
 	})
 
-	// BUG: destroy() (module disabled / config changed) cancels a running pulse timer without restoring the pins, leaving the GPO latched active
-	it.fails('destroy during a pulse restores the pins', async () => {
+	it('destroy during a pulse restores the pins', async () => {
 		const r = rig('xnode2-combo')
 		await r.ops.gpoPulse(1, [1], 5000)
-		r.ops.destroy()
-		await vi.advanceTimersByTimeAsync(10)
+		await r.ops.destroy()
 		expect(r.ctl.commands.at(-1)).toBe('GPO 1 hhhhh')
+		await vi.advanceTimersByTimeAsync(10_000)
+		expect(r.ctl.commands).toHaveLength(2) // the timer was cancelled, restored once
+	})
+
+	it('destroy restores several pins of a port with one write, and logs when it cannot', async () => {
+		const r = rig('xnode2-combo')
+		await r.ops.gpoPulse(1, [1, 2], 5000)
+		r.ctl.failWith = new Error('link down')
+		await r.ops.destroy()
+		expect(r.logs.some(([l, m]) => l === 'error' && /could not restore.*shutdown/.test(m))).toBe(true)
+		r.ctl.failWith = undefined
+		r.ctl.commands.length = 0
+		const r2 = rig('xnode2-combo')
+		await r2.ops.gpoPulse(1, [1, 2], 5000)
+		await r2.ops.destroy()
+		expect(r2.ctl.commands).toEqual(['GPO 1 lhhhh'.replace('lhhhh', 'llhhh'), 'GPO 1 hhhhh'])
+	})
+
+	it('destroy is bounded when the restore hangs', async () => {
+		const r = rig('xnode2-combo')
+		await r.ops.gpoPulse(1, [1], 5000)
+		r.ctl.writeAndVerify = async () => new Promise(() => undefined)
+		const p = r.ops.destroy()
+		await vi.advanceTimersByTimeAsync(DESTROY_RESTORE_TIMEOUT_MS + 10)
+		await p
+		expect(r.logs.some(([l, m]) => l === 'error' && /timed out/.test(m))).toBe(true)
+	})
+
+	it('the restore is armed even when the verification of the pulse write fails', async () => {
+		const r = rig('xnode2-combo')
+		const orig = r.ctl.writeAndVerify.bind(r.ctl)
+		let first = true
+		r.ctl.writeAndVerify = async (cmd, target) => {
+			const line = await orig(cmd, target)
+			if (first) {
+				first = false
+				throw new Error('query timed out')
+			}
+			return line
+		}
+		await expect(r.ops.gpoPulse(1, [1], 200)).rejects.toThrow(/timed out/)
+		expect(r.state.gpo.get(1)).toBe('lhhhh') // the pin did change
+		await vi.advanceTimersByTimeAsync(201)
+		expect(r.ctl.commands.at(-1)).toBe('GPO 1 hhhhh')
+		expect(r.state.gpo.get(1)).toBe('hhhhh')
+	})
+
+	it('a restore that fails while the link is down is retried once it is back', async () => {
+		const r = rig('xnode2-combo')
+		await r.ops.gpoPulse(1, [1], 100)
+		r.ctl.isSynced = false
+		await vi.advanceTimersByTimeAsync(101)
+		expect(r.ctl.commands).toHaveLength(1)
+		await vi.advanceTimersByTimeAsync(PULSE_RESTORE_RETRY_MS * 3)
+		expect(r.ctl.commands).toHaveLength(1)
+		expect(r.logs.some(([l, m]) => l === 'warn' && /retrying/.test(m))).toBe(true)
+		r.ctl.isSynced = true
+		await vi.advanceTimersByTimeAsync(PULSE_RESTORE_RETRY_MS)
+		expect(r.ctl.commands).toEqual(['GPO 1 lhhhh', 'GPO 1 hhhhh'])
+		await vi.advanceTimersByTimeAsync(PULSE_RESTORE_RETRY_MS * 5)
+		expect(r.ctl.commands).toHaveLength(2)
+	})
+
+	it('gives up after the bounded number of attempts and says so', async () => {
+		const r = rig('xnode2-combo')
+		await r.ops.gpoPulse(1, [1], 100)
+		r.ctl.isSynced = false
+		await vi.advanceTimersByTimeAsync(101 + PULSE_RESTORE_RETRY_MS * (PULSE_RESTORE_MAX_ATTEMPTS + 2))
+		expect(r.logs.some(([l, m]) => l === 'error' && /giving up/.test(m))).toBe(true)
+		r.ctl.isSynced = true
+		await vi.advanceTimersByTimeAsync(PULSE_RESTORE_RETRY_MS * 3)
+		expect(r.ctl.commands).toHaveLength(1)
+	})
+
+	it('a pulse on an already active pin with no running pulse changes nothing', async () => {
+		const r = rig('xnode2-combo')
+		apply(r.state, 'GPO 1 lhhhh')
+		await r.ops.gpoPulse(1, [1], 100)
+		await vi.advanceTimersByTimeAsync(200)
+		expect(r.ctl.commands).toEqual([])
 	})
 })
 
@@ -1063,6 +1143,15 @@ describe('mic gain', () => {
 			const r = rig('xnode2-combo')
 			await settle(r.ops.micGainAdjust(5, -10))
 			expect(r.ctl.commands).toEqual([])
+		})
+		it('stepping down from 140 reaches 0, however small the step', async () => {
+			const r = rig('xnode2-combo')
+			apply(r.state, 'INP 5 GAIN:140')
+			await settle(r.ops.micGainAdjust(5, -10))
+			expect(r.ctl.commands).toEqual(['INP 5 GAIN:0'])
+			apply(r.state, 'INP 5 GAIN:200')
+			await settle(r.ops.micGainAdjust(5, -10))
+			expect(r.ctl.commands.at(-1)).toBe('INP 5 GAIN:190')
 		})
 		it('going below 140 drops to 0, clamps at 690', async () => {
 			const r = rig('xnode2-combo')
@@ -1200,12 +1289,13 @@ describe('DST', () => {
 				await Promise.all(qs)
 				expect(r.ctl.commands.at(-1)).toBe('DST 1 OUGN:240')
 			})
-			it('fails when the current gain is unknown', async () => {
+			it('an absent OUGN (legacy node) counts as 0 dB', async () => {
 				const r = rig()
 				delete r.state.dst.get(1)!.OUGN
-				const p = r.ops.dstGainAdjust(1, 5).catch((e: Error) => e.message)
+				const p = r.ops.dstGainAdjust(1, 5)
 				await vi.advanceTimersByTimeAsync(100)
-				expect(await p).toMatch(/not known/)
+				await p
+				expect(r.ctl.commands).toEqual(['DST 1 OUGN:5'])
 			})
 		})
 	})
@@ -1490,5 +1580,169 @@ describe('serialisation', () => {
 			'start DST 1 ADDR:""',
 			'end DST 1 ADDR:""',
 		])
+	})
+})
+
+// ------------------------------------------------------------------ F3 regressions
+
+describe('latest value wins for absolute sets', () => {
+	/** Hold the first write until released, so later calls pile up in the queue. */
+	function gate(r: Rig): { release: () => void } {
+		const orig = r.ctl.writeAndVerify.bind(r.ctl)
+		let release!: () => void
+		const held = new Promise<void>((res) => (release = res))
+		let first = true
+		r.ctl.writeAndVerify = async (cmd, target) => {
+			if (first) {
+				first = false
+				await held
+			}
+			return orig(cmd, target)
+		}
+		return { release }
+	}
+
+	const started = async (): Promise<void> => new Promise((res) => setTimeout(res, 5))
+
+	it('queued gain sets on one target collapse into the last value', async () => {
+		const r = rig()
+		apply(r.state, 'DST 1 OUGN:0')
+		const g = gate(r)
+		const first = r.ops.dstGainSet(1, 10) // now blocked in the write
+		await started()
+		const ps = [20, 30, 40, 50].map(async (v) => r.ops.dstGainSet(1, v))
+		g.release()
+		await Promise.all([first, ...ps])
+		expect(r.ctl.commands).toEqual(['DST 1 OUGN:10', 'DST 1 OUGN:50'])
+	})
+
+	it('same for mix_set, src and mic gain', async () => {
+		const r = rig('xnode2-combo')
+		apply(r.state, 'SRC 1 INGN:0')
+		const g = gate(r)
+		const first = r.ops.dstGainSet(1, 5)
+		await started()
+		const ps = [
+			r.ops.mixSet([[9, 1]], -10),
+			r.ops.mixSet([[9, 1]], -20),
+			r.ops.mixSet([[9, 1]], -30),
+			r.ops.srcGainSet(1, 10),
+			r.ops.srcGainSet(1, 20),
+			r.ops.micGainSet(5, 200),
+			r.ops.micGainSet(5, 300),
+		]
+		g.release()
+		await Promise.all([first, ...ps])
+		expect(r.ctl.commands).toEqual(['DST 1 OUGN:5', 'MIX 9 1:-30', 'SRC 1 INGN:20', 'INP 5 GAIN:300'])
+	})
+
+	it('call order is kept: a write is never replaced across a different target', async () => {
+		const r = rig()
+		apply(r.state, 'DST 1 OUGN:0')
+		apply(r.state, 'DST 2 OUGN:0')
+		const g = gate(r)
+		const first = r.ops.dstGainSet(2, 1)
+		await started()
+		const ps = [r.ops.dstGainSet(1, 5), r.ops.dstGainSet(1, 10), r.ops.dstGainSet(2, 20), r.ops.dstGainSet(1, 30)]
+		g.release()
+		await Promise.all([first, ...ps])
+		expect(r.ctl.commands).toEqual(['DST 2 OUGN:1', 'DST 1 OUGN:10', 'DST 2 OUGN:20', 'DST 1 OUGN:30'])
+	})
+
+	it('toggle is decided from the state when it runs, repeated presses collapse', async () => {
+		const r = rig()
+		const g = gate(r)
+		const first = r.ops.mixSet([[9, 1]], 0)
+		await started()
+		const ps = [first, r.ops.mixToggle([[9, 1]], -30), r.ops.mixToggle([[9, 1]], -30), r.ops.mixToggle([[9, 1]], -30)]
+		g.release()
+		await Promise.all(ps)
+		// the toggle saw the crosspoint on (written by the set before it) and cleared it
+		expect(r.ctl.commands).toEqual(['MIX 9 1:0', 'MIX 9 1:-'])
+	})
+
+	it('exclusive collapses and a failure reaches every waiter', async () => {
+		const r = rig()
+		const g = gate(r)
+		const first = r.ops.mixSet([[9, 1]], 0)
+		await started()
+		const ps = [first, r.ops.mixExclusive([[1, 3]], 0), r.ops.mixExclusive([[1, 3]], -5)]
+		g.release()
+		await Promise.all(ps)
+		expect(r.ctl.commands).toHaveLength(2)
+		expect(r.ctl.commands[1]).toContain('3:-5')
+		expect(r.state.mix.get(1)).toEqual(new Map([[3, -5]]))
+		r.ctl.failWith = new LwrpError(1001, 'syntax error')
+		const a = r.ops.mixSet([[9, 2]], 0)
+		const b = r.ops.mixSet([[9, 2]], -5)
+		await expect(a).rejects.toThrow(/1001/)
+		await expect(b).rejects.toThrow(/1001/)
+	})
+})
+
+describe('SRC address keeps the payload-type suffix', () => {
+	it('re-sends the existing ;rtp-pt suffix and accepts the read-back', async () => {
+		const r = rig('xnode2-combo')
+		apply(r.state, 'SRC 1 RTPA:"239.192.87.29;rtp-pt=97"')
+		await r.ops.srcSetAddress(1, 22302)
+		expect(r.ctl.commands).toEqual(['SRC 1 RTPA:"239.192.87.30;rtp-pt=97"'])
+		expect(r.state.src.get(1)?.RTPA).toBe('239.192.87.30;rtp-pt=97')
+	})
+	it('no suffix, no suffix sent', async () => {
+		const r = rig('xnode2-combo')
+		apply(r.state, 'SRC 1 RTPA:"239.192.87.29"')
+		await r.ops.srcSetAddress(1, '239.192.87.30')
+		expect(r.ctl.commands).toEqual(['SRC 1 RTPA:"239.192.87.30"'])
+	})
+})
+
+describe('crosspoint budget while writing several rows', () => {
+	it('snapshot recall writes the rows that free crosspoints first', async () => {
+		const r = rig()
+		fillBudget(r.state, 219)
+		const peaks: number[] = []
+		const orig = r.ctl.writeAndVerify.bind(r.ctl)
+		r.ctl.writeAndVerify = async (cmd, target) => {
+			const line = await orig(cmd, target)
+			peaks.push(r.state.xpointsUsed())
+			return line
+		}
+		const g1 = r.state.getXpoint(1, 17) as number
+		const snap = { v: 1, devn: 'axiaxnode.analog4x4', mix: { '1': { '17': g1, '3': 0, '4': 0 }, '2': {} } }
+		expect(await r.ops.mixSnapshotRecall(JSON.stringify(snap))).toBe(3)
+		expect(r.ctl.commands.map((c) => c.split(' ')[1])).toEqual(['2', '1'])
+		expect(Math.max(...peaks)).toBeLessThanOrEqual(220)
+		expect(r.state.xpointsUsed()).toBe(220)
+	})
+	it('the budget of the final result is still enforced', async () => {
+		const r = rig()
+		fillBudget(r.state, 219)
+		const snap = { v: 1, devn: 'axiaxnode.analog4x4', mix: { '1': { '17': 0, '3': 0, '4': 0 } } }
+		await expect(r.ops.mixSnapshotRecall(JSON.stringify(snap))).rejects.toThrow(/budget/)
+		expect(r.ctl.commands).toEqual([])
+	})
+})
+
+describe('srcEnable', () => {
+	it('refuses an unknown mode without writing', async () => {
+		const r = rig()
+		await expect(r.ops.srcEnable(1, 'maybe' as unknown as 'on')).rejects.toThrow(/Unknown stream enable mode/)
+		expect(r.ctl.commands).toEqual([])
+	})
+})
+
+describe('absent gain attribute', () => {
+	it('src gain adjust treats a missing INGN as 0 dB', async () => {
+		vi.useFakeTimers()
+		try {
+			const r = rig()
+			delete r.state.src.get(1)!.INGN
+			const p = r.ops.srcGainAdjust(1, 5)
+			await vi.advanceTimersByTimeAsync(100)
+			await p
+			expect(r.ctl.commands).toEqual(['SRC 1 INGN:5'])
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 })

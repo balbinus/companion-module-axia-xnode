@@ -124,12 +124,13 @@ export function UpdateActions(self: ModuleInstance): void {
 	const hasGpo = !known || state.ngpo > 0
 	const hasMic = !known || (state.isXNode2 && micChoices(state).length > 0)
 
-	/** Run an operation; refusals and failures are logged as warnings, never thrown to Companion. */
+	/** Run an operation; refusals and failures are logged as warnings and rethrown so Companion reports the action as failed. */
 	const guard = async (name: string, fn: () => Promise<void>): Promise<void> => {
 		try {
 			await fn()
 		} catch (e) {
 			self.log('warn', `${name}: ${e instanceof Error ? e.message : String(e)}`)
+			throw e
 		}
 	}
 	const xpoints = (o: Partial<XpointPickerOptions>): Array<[number, number]> => {
@@ -200,7 +201,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					return await self.ops.mixSnapshotStore()
 				} catch (e) {
 					self.log('warn', `mix_snapshot_store: ${e instanceof Error ? e.message : String(e)}`)
-					return ''
+					throw e
 				}
 			},
 		}

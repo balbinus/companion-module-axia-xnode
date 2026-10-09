@@ -1,5 +1,5 @@
 import { InstanceBase, InstanceStatus, type SomeCompanionConfigField } from '@companion-module/base'
-import { GetConfigFields, type ModuleConfig } from './config.js'
+import { GetConfigFields, type ModuleConfig, type ModuleSecrets, type StoredConfig } from './config.js'
 import { XNodeController, type ControllerStatus } from './device/controller.js'
 import { XNodeOperations } from './device/operations.js'
 import type { StateChange } from './model/state.js'
@@ -10,8 +10,8 @@ import { CheckFeedbacksForChanges, UpdateFeedbacks, type FeedbacksSchema } from 
 import { UpdatePresets } from './presets.js'
 
 export type ModuleSchema = {
-	config: ModuleConfig
-	secrets: undefined
+	config: StoredConfig
+	secrets: ModuleSecrets | undefined
 	actions: ActionsSchema
 	feedbacks: FeedbacksSchema
 	variables: VariablesSchema
@@ -43,8 +43,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		super(internal)
 	}
 
-	async init(config: ModuleConfig): Promise<void> {
-		this.config = config
+	async init(config: StoredConfig, _isFirstInit: boolean, secrets: ModuleSecrets | undefined): Promise<void> {
+		this.config = { ...config, password: secrets?.password ?? '' }
 		this.startDevice()
 		this.rebuildDefinitions()
 	}
@@ -52,12 +52,12 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	// When module gets deleted
 	async destroy(): Promise<void> {
 		this.log('debug', 'destroy')
-		this.stopDevice()
+		await this.stopDevice()
 	}
 
-	async configUpdated(config: ModuleConfig): Promise<void> {
-		this.stopDevice()
-		this.config = config
+	async configUpdated(config: StoredConfig, secrets: ModuleSecrets | undefined): Promise<void> {
+		await this.stopDevice()
+		this.config = { ...config, password: secrets?.password ?? '' }
 		this.startDevice()
 		this.rebuildDefinitions()
 	}
@@ -95,12 +95,17 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		controller.start()
 	}
 
-	private stopDevice(): void {
+	private async stopDevice(): Promise<void> {
 		clearTimeout(this.flushTimer)
 		clearTimeout(this.rebuildTimer)
 		this.flushTimer = this.rebuildTimer = undefined
 		this.pending = []
-		this.ops?.destroy()
+		// Let the operations restore running GPO pulses while the connection is still open (bounded).
+		try {
+			await this.ops?.destroy()
+		} catch (e) {
+			this.log('warn', `Shutdown: ${e instanceof Error ? e.message : String(e)}`)
+		}
 		this.controller?.destroy()
 	}
 

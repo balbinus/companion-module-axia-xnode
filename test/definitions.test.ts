@@ -174,9 +174,12 @@ describe('action definitions', () => {
 			).toHaveBeenCalledWith(expect.any(Array), 0)
 		})
 		it('an input pair that does not exist is refused without calling ops', async () => {
-			const f = await run('legacy-analog4x4-a', 'mix_set', { ...pick, in_pair: 25, gain: 0 })
+			const f = fakeSelf('legacy-analog4x4-a')
+			UpdateActions(asSelf(f.self))
+			await expect(f.self.actions.mix_set.callback({ options: { ...pick, in_pair: 25, gain: 0 } })).rejects.toThrow(
+				/does not exist/,
+			)
 			expect(f.ops.mixSet).not.toHaveBeenCalled()
-			expect(f.self.log).toHaveBeenCalledWith('warn', expect.stringContaining('does not exist'))
 		})
 		it('mix_clear_output expands a stereo pair to both rows', async () => {
 			const { ops } = await run('legacy-analog4x4-a', 'mix_clear_output', { mode: 'stereo', out_pair: 1, out_ch: 1 })
@@ -189,18 +192,19 @@ describe('action definitions', () => {
 			await f.self.actions.mix_snapshot_recall.callback({ options: { snapshot: '{"a":1}' } })
 			expect(f.ops.mixSnapshotRecall).toHaveBeenCalledWith('{"a":1}')
 		})
-		it('a refused operation is logged, not thrown', async () => {
+		it('a refused operation is logged and rethrown so Companion reports the failure', async () => {
 			const f = fakeSelf('legacy-analog4x4-a')
 			f.ops.mixSet.mockRejectedValueOnce(new Error('nope'))
 			UpdateActions(asSelf(f.self))
-			await expect(f.self.actions.mix_set.callback({ options: { ...pick, gain: 0 } })).resolves.toBeUndefined()
+			await expect(f.self.actions.mix_set.callback({ options: { ...pick, gain: 0 } })).rejects.toThrow('nope')
 			expect(f.self.log).toHaveBeenCalledWith('warn', 'mix_set: nope')
 		})
-		it('snapshot store failure returns an empty string', async () => {
+		it('snapshot store failure is logged and rethrown', async () => {
 			const f = fakeSelf('legacy-analog4x4-a')
 			f.ops.mixSnapshotStore.mockRejectedValueOnce(new Error('nope'))
 			UpdateActions(asSelf(f.self))
-			expect(await f.self.actions.mix_snapshot_store.callback({ options: {} })).toBe('')
+			await expect(f.self.actions.mix_snapshot_store.callback({ options: {} })).rejects.toThrow('nope')
+			expect(f.self.log).toHaveBeenCalledWith('warn', 'mix_snapshot_store: nope')
 		})
 		it('GPO actions', async () => {
 			const set = await run('xnode2-combo', 'gpo_set', { port: 1, pins: [1, 2], active: 'active' })

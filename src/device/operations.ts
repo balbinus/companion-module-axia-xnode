@@ -5,6 +5,7 @@ import {
 	isIpv4Multicast,
 	isValidChannel,
 	normaliseAddr,
+	splitAddrSuffix,
 	type ChannelKind,
 } from '../lwrp/livewire.js'
 import { formatCommand, mixCommand, quote } from '../lwrp/parser.js'
@@ -41,6 +42,12 @@ export const PULSE_MIN_MS = 20
 export const PULSE_MAX_MS = 600_000
 export const SRC_MODES = { live: 12, standard: 240, aes67: 48 } as const
 export const GPO_PINS = 5
+/** A failed pulse restore is retried this often while the link is down (or the node refuses)... */
+export const PULSE_RESTORE_RETRY_MS = 2000
+/** ...at most this many times (about 3 minutes), then it is given up with an error in the log. */
+export const PULSE_RESTORE_MAX_ATTEMPTS = 90
+/** destroy() waits at most this long for the final pulse restore. */
+export const DESTROY_RESTORE_TIMEOUT_MS = 2500
 
 // eslint-disable-next-line no-control-regex
 const UNSAFE_CHARS = /[\u0000-\u001f\u007f"\\]/g
@@ -66,9 +73,19 @@ interface PendingAdjust {
 }
 
 interface PendingPulse {
-	timer: NodeJS.Timeout
+	timer: NodeJS.Timeout | undefined
 	/** Level before the first (not yet restored) pulse */
 	previous: 'h' | 'l'
+	/** Failed restore attempts so far */
+	attempts: number
+}
+
+/** A queued absolute write; later calls for the same key replace `fn` while it is still waiting in the queue. */
+interface LatestEntry {
+	key: string
+	fn: () => Promise<void>
+	open: boolean
+	waiters: Array<{ resolve: () => void; reject: (e: Error) => void }>
 }
 
 type Permission = 'mixer' | 'source' | 'gpo'
@@ -98,6 +115,8 @@ export class XNodeOperations {
 	private readonly adjusts = new Map<string, PendingAdjust>()
 	private readonly pulses = new Map<string, PendingPulse>()
 	private destroyed = false
+	/** The most recently queued latest-wins write; only that one can still be replaced (keeps call order). */
+	private tail: LatestEntry | undefined
 
 	constructor(
 		readonly controller: XNodeController,
@@ -105,15 +124,54 @@ export class XNodeOperations {
 		readonly log: LogFn,
 	) {}
 
-	destroy(): void {
+	/**
+	 * Stop accepting operations, drop pending adjusts and make a best-effort restore of every active GPO pulse.
+	 * Call (and await) it before the controller is destroyed, so the connection is still open for the restore.
+	 */
+	async destroy(): Promise<void> {
 		this.destroyed = true
 		for (const p of this.adjusts.values()) {
 			clearTimeout(p.timer)
 			for (const w of p.waiters) w.resolve()
 		}
 		this.adjusts.clear()
-		for (const p of this.pulses.values()) clearTimeout(p.timer)
+		const active = [...this.pulses.entries()]
 		this.pulses.clear()
+		const byPort = new Map<number, Map<number, 'h' | 'l'>>()
+		for (const [key, p] of active) {
+			clearTimeout(p.timer)
+			const [port, pin] = key.split('.').map(Number)
+			const pins = byPort.get(port) ?? new Map<number, 'h' | 'l'>()
+			pins.set(pin, p.previous)
+			byPort.set(port, pins)
+		}
+		if (byPort.size === 0) return
+		let bound: NodeJS.Timeout | undefined
+		const restore = (async () => {
+			for (const [port, pins] of byPort) {
+				try {
+					await this.serial(async () =>
+						this.writePins(port, [...pins.keys()], (pin) => pins.get(pin) as 'h' | 'l', false, true),
+					)
+					this.log('info', `GPO ${port}: pulse restored on shutdown`)
+				} catch (e) {
+					this.log(
+						'error',
+						`GPO ${port}: could not restore the pulsed pins on shutdown, they may stay active: ${errText(e)}`,
+					)
+				}
+			}
+		})()
+		await Promise.race([
+			restore,
+			new Promise<void>((resolve) => {
+				bound = setTimeout(() => {
+					this.log('error', 'GPO pulse restore on shutdown timed out, pins may stay active')
+					resolve()
+				}, DESTROY_RESTORE_TIMEOUT_MS)
+			}),
+		])
+		clearTimeout(bound)
 	}
 
 	// ---------------------------------------------------------------- plumbing
@@ -124,13 +182,44 @@ export class XNodeOperations {
 
 	/** Runs `fn` after all earlier operations finished, so decisions see the state left by the previous write. */
 	private async serial<T>(fn: () => Promise<T>): Promise<T> {
+		this.tail = undefined
+		return this.enqueue(fn)
+	}
+
+	private async enqueue<T>(fn: () => Promise<T>): Promise<T> {
 		const run = this.chain.then(fn, fn)
 		this.chain = run.catch(() => undefined)
 		return run
 	}
 
-	private require(permission: Permission | null): void {
-		if (this.destroyed) throw new Error('The module is shutting down')
+	/**
+	 * Absolute writes (set, toggle, exclusive): while one for `key` still waits in the queue and nothing else was
+	 * queued after it, a newer call replaces it (latest value wins) and both callers get the outcome of the one write.
+	 * A repeating button therefore cannot build a backlog. `fn` runs serially and must decide from the state at that time.
+	 */
+	private async latestWins(key: string, fn: () => Promise<void>): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const tail = this.tail
+			if (tail?.open && tail.key === key) {
+				tail.fn = fn
+				tail.waiters.push({ resolve, reject })
+				return
+			}
+			const entry: LatestEntry = { key, fn, open: true, waiters: [{ resolve, reject }] }
+			this.tail = entry
+			this.enqueue(async () => {
+				entry.open = false
+				if (this.tail === entry) this.tail = undefined
+				await entry.fn()
+			}).then(
+				() => entry.waiters.forEach((w) => w.resolve()),
+				(e: unknown) => entry.waiters.forEach((w) => w.reject(e instanceof Error ? e : new Error(errText(e)))),
+			)
+		})
+	}
+
+	private require(permission: Permission | null, restoring = false): void {
+		if (this.destroyed && !restoring) throw new Error('The module is shutting down')
 		if (!this.controller.isConnected) throw new Error('Not connected to the node')
 		if (!this.controller.isSynced) throw new Error('The node is still being read, try again in a moment')
 		if (permission === null) return
@@ -263,12 +352,19 @@ export class XNodeOperations {
 		}
 
 		const rows = new Map<number, Array<[number, number | null]>>()
+		const rowDelta = new Map<number, number>()
 		for (const [out, inp, value] of final.values()) {
 			const row = rows.get(out) ?? []
 			row.push([inp, value])
 			rows.set(out, row)
+			rowDelta.set(
+				out,
+				(rowDelta.get(out) ?? 0) + (value !== null ? 1 : 0) - (isXpointOn(st.getXpoint(out, inp)) ? 1 : 0),
+			)
 		}
-		for (const [out, entries] of rows) {
+		// Rows that free crosspoints go first, so the budget is never exceeded in between (the check above covers the end result).
+		const ordered = [...rows].sort((a, b) => (rowDelta.get(a[0]) ?? 0) - (rowDelta.get(b[0]) ?? 0))
+		for (const [out, entries] of ordered) {
 			entries.sort((a, b) => a[0] - b[0])
 			await this.send(mixCommand(out, entries), { verb: 'MIX', index: out })
 			for (const [inp, value] of entries) {
@@ -284,7 +380,9 @@ export class XNodeOperations {
 	async mixSet(xpoints: Array<[number, number]>, tenths: number): Promise<void> {
 		this.require('mixer')
 		XNodeOperations.integer(tenths, 'Crosspoint gain')
-		await this.serial(async () => this.writeXpoints(xpoints.map(([o, i]) => [o, i, tenths])))
+		await this.latestWins(`mixset:${xpoints.map(([o, i]) => `${o}/${i}`).join(',')}`, async () =>
+			this.writeXpoints(xpoints.map(([o, i]) => [o, i, tenths])),
+		)
 	}
 
 	async mixClear(xpoints: Array<[number, number]>): Promise<void> {
@@ -292,11 +390,14 @@ export class XNodeOperations {
 		await this.serial(async () => this.writeXpoints(xpoints.map(([o, i]) => [o, i, null])))
 	}
 
-	/** All target crosspoints on -> clear all; otherwise set all at `onTenths`. */
+	/**
+	 * All target crosspoints on -> clear all; otherwise set all at `onTenths`. Decided from the state when the write
+	 * runs. Several presses queued behind a busy write collapse into one toggle.
+	 */
 	async mixToggle(xpoints: Array<[number, number]>, onTenths: number): Promise<void> {
 		this.require('mixer')
 		XNodeOperations.integer(onTenths, 'Crosspoint gain')
-		await this.serial(async () => {
+		await this.latestWins(`mixtoggle:${xpoints.map(([o, i]) => `${o}/${i}`).join(',')}`, async () => {
 			const allOn = xpoints.length > 0 && xpoints.every(([o, i]) => isXpointOn(this.state.getXpoint(o, i)))
 			return this.writeXpoints(xpoints.map(([o, i]) => [o, i, allOn ? null : onTenths]))
 		})
@@ -336,10 +437,11 @@ export class XNodeOperations {
 	async mixExclusive(xpoints: Array<[number, number]>, onTenths: number): Promise<void> {
 		this.require('mixer')
 		XNodeOperations.integer(onTenths, 'Crosspoint gain')
-		await this.serial(async () => {
+		await this.latestWins(`mixexcl:${xpoints.map(([o, i]) => `${o}/${i}`).join(',')}`, async () => {
 			const st = this.state
 			const changes: XpointChange[] = []
 			for (const [out, keep] of xpoints) {
+				// Deliberate: besides every input of the map, stray active inputs outside it (e.g. stored 25/26) are cleared too.
 				const inputs = new Set<number>(st.ioMap.inputs.map((c) => c.number))
 				for (const [i, g] of st.mix.get(out) ?? []) if (isXpointOn(g)) inputs.add(i)
 				for (const i of inputs) if (i !== keep) changes.push([out, i, null])
@@ -396,8 +498,7 @@ export class XNodeOperations {
 				const out = Number(outKey)
 				const wanted = new Map<number, number>()
 				for (const [inKey, g] of Object.entries(row)) {
-					const value = clamp(g, min, max)
-					if (value > XPOINT_OFF_TENTHS) wanted.set(Number(inKey), value)
+					if (g > XPOINT_OFF_TENTHS) wanted.set(Number(inKey), clamp(g, min, max)) // "on" is decided before clamping
 				}
 				const current = new Map<number, number>()
 				for (const inp of st.ioMap.inputs) {
@@ -472,14 +573,15 @@ export class XNodeOperations {
 		return unique
 	}
 
-	/** Write new levels for `pins`; must run inside `serial`. `permission` false is used by pulse restores. */
+	/** Write new levels for `pins`; must run inside `serial`. `permission` false is used by pulse restores (`restoring` also works while shutting down). */
 	private async writePins(
 		port: number,
 		pins: number[],
 		level: (pin: number, current: 'h' | 'l') => 'h' | 'l',
 		permission = true,
+		restoring = false,
 	): Promise<void> {
-		this.require(permission ? 'gpo' : null)
+		this.require(permission ? 'gpo' : null, restoring)
 		this.index('GPO', port)
 		const current = this.pinLevels(port)
 		const next = current.split('')
@@ -503,8 +605,13 @@ export class XNodeOperations {
 	}
 
 	/**
-	 * Drive the pins to the active (or inactive) level, then restore the level they had before the pulse
-	 * after `ms`. Re-triggering a running pulse restarts its timer and still restores the original level.
+	 * Drive the pins to the active (or inactive) level, then restore the level they had before the pulse after `ms`.
+	 * - The restore timer is armed as soon as the write was attempted, even when verification fails or times out, so a
+	 *   pin that did change can never stay latched; the original error is still thrown.
+	 * - A pulse on a pin whose pulse is still running restarts the timer and restores the level from before the first pulse.
+	 * - A pulse on a pin that already has the pulse level (and no running pulse) has nothing to restore: it is a no-op.
+	 * - A failed restore (link down, node refuses) is retried every PULSE_RESTORE_RETRY_MS, up to PULSE_RESTORE_MAX_ATTEMPTS.
+	 * - destroy() restores running pulses right away.
 	 */
 	async gpoPulse(port: number, pins: number[], ms: number, active = true): Promise<void> {
 		this.require('gpo')
@@ -520,21 +627,54 @@ export class XNodeOperations {
 			for (const pin of unique) {
 				previous.set(pin, this.pulses.get(`${port}.${pin}`)?.previous ?? (current[pin - 1] as 'h' | 'l'))
 			}
-			await this.writePins(port, unique, () => (active ? 'l' : 'h'))
-			for (const pin of unique) {
-				const key = `${port}.${pin}`
-				clearTimeout(this.pulses.get(key)?.timer)
-				const prev = previous.get(pin) as 'h' | 'l'
-				const timer = setTimeout(() => {
-					this.pulses.delete(key)
-					if (this.destroyed) return
-					this.serial(async () => this.writePins(port, [pin], () => prev, false)).catch((e: unknown) =>
-						this.log('warn', `GPO ${port} pin ${pin}: could not restore after pulse: ${errText(e)}`),
-					)
-				}, ms)
-				this.pulses.set(key, { timer, previous: prev })
+			let failure: unknown
+			try {
+				await this.writePins(port, unique, () => (active ? 'l' : 'h'))
+			} catch (e) {
+				failure = e
+			}
+			if (this.destroyed) return
+			for (const pin of unique) this.armRestore(port, pin, previous.get(pin) as 'h' | 'l', ms)
+			if (failure !== undefined) {
+				this.log(
+					'warn',
+					`GPO ${port}: the pulse write was not confirmed, the pins will still be restored after ${ms} ms`,
+				)
+				throw failure instanceof Error ? failure : new Error(errText(failure))
 			}
 		})
+	}
+
+	private armRestore(port: number, pin: number, previous: 'h' | 'l', ms: number): void {
+		const key = `${port}.${pin}`
+		clearTimeout(this.pulses.get(key)?.timer)
+		const entry: PendingPulse = { timer: undefined, previous, attempts: 0 }
+		entry.timer = setTimeout(() => this.runRestore(key, port, pin, entry), ms)
+		this.pulses.set(key, entry)
+	}
+
+	private runRestore(key: string, port: number, pin: number, entry: PendingPulse): void {
+		entry.timer = undefined
+		if (this.destroyed || this.pulses.get(key) !== entry) return
+		this.serial(async () => this.writePins(port, [pin], () => entry.previous, false)).then(
+			() => {
+				if (this.pulses.get(key) === entry) this.pulses.delete(key)
+			},
+			(e: unknown) => {
+				if (this.destroyed || this.pulses.get(key) !== entry) return
+				entry.attempts++
+				if (entry.attempts >= PULSE_RESTORE_MAX_ATTEMPTS) {
+					this.pulses.delete(key)
+					this.log(
+						'error',
+						`GPO ${port} pin ${pin}: giving up restoring after the pulse (${errText(e)}); the pin may stay active`,
+					)
+					return
+				}
+				this.log('warn', `GPO ${port} pin ${pin}: could not restore after pulse, retrying: ${errText(e)}`)
+				entry.timer = setTimeout(() => this.runRestore(key, port, pin, entry), PULSE_RESTORE_RETRY_MS)
+			},
+		)
 	}
 
 	// ---------------------------------------------------------------- mic gain (xNode2)
@@ -550,7 +690,7 @@ export class XNodeOperations {
 	async micGainSet(inp: number, tenths: number): Promise<void> {
 		this.require('source')
 		XNodeOperations.integer(tenths, 'Mic gain')
-		await this.serial(async () => {
+		await this.latestWins(`micgain:${inp}`, async () => {
 			this.require('source')
 			this.micInput(inp)
 			await this.writeMicGain(inp, normaliseMicGain(tenths))
@@ -566,10 +706,17 @@ export class XNodeOperations {
 			this.micInput(inp)
 			const current = attrInt(this.state.inp.get(inp)?.GAIN)
 			if (current === undefined) throw new Error(`The gain of INP ${inp} is not known`)
-			await this.writeMicGain(
-				inp,
-				normaliseMicGain(current < MIC_GAIN_MIN_TENTHS && total > 0 ? MIC_GAIN_MIN_TENTHS : current + total),
-			)
+			// 0 and 140...690 are the only usable values: from 0 any positive step goes to 140, from 140 any negative step to 0.
+			const raw = current + total
+			const target =
+				current < MIC_GAIN_MIN_TENTHS
+					? total > 0
+						? MIC_GAIN_MIN_TENTHS
+						: 0
+					: raw < MIC_GAIN_MIN_TENTHS
+						? 0
+						: normaliseMicGain(raw)
+			await this.writeMicGain(inp, target)
 		})
 	}
 
@@ -618,7 +765,7 @@ export class XNodeOperations {
 	async dstGainSet(n: number, tenths: number): Promise<void> {
 		this.require('mixer')
 		XNodeOperations.integer(tenths, 'Gain')
-		await this.serial(async () => this.writeDstGain(n, tenths))
+		await this.latestWins(`dstgain:${n}`, async () => this.writeDstGain(n, tenths))
 	}
 
 	async dstGainAdjust(n: number, deltaTenths: number): Promise<void> {
@@ -626,9 +773,8 @@ export class XNodeOperations {
 		XNodeOperations.integer(deltaTenths, 'Gain step')
 		this.index('DST', n)
 		await this.coalesce(`dst:${n}`, deltaTenths, async (total) => {
-			const current = attrInt(this.state.dst.get(n)?.OUGN)
-			if (current === undefined) throw new Error(`The gain of DST ${n} is not known`)
-			await this.writeDstGain(n, current + total)
+			// Legacy nodes may omit OUGN: absent means 0 dB.
+			await this.writeDstGain(n, (attrInt(this.state.dst.get(n)?.OUGN) ?? 0) + total)
 		})
 	}
 
@@ -646,7 +792,7 @@ export class XNodeOperations {
 	async srcGainSet(n: number, tenths: number): Promise<void> {
 		this.require('source')
 		XNodeOperations.integer(tenths, 'Gain')
-		await this.serial(async () => this.writeSrcGain(n, tenths))
+		await this.latestWins(`srcgain:${n}`, async () => this.writeSrcGain(n, tenths))
 	}
 
 	async srcGainAdjust(n: number, deltaTenths: number): Promise<void> {
@@ -654,9 +800,8 @@ export class XNodeOperations {
 		XNodeOperations.integer(deltaTenths, 'Gain step')
 		this.index('SRC', n)
 		await this.coalesce(`src:${n}`, deltaTenths, async (total) => {
-			const current = attrInt(this.state.src.get(n)?.INGN)
-			if (current === undefined) throw new Error(`The gain of SRC ${n} is not known`)
-			await this.writeSrcGain(n, current + total)
+			// Legacy nodes may omit INGN: absent means 0 dB.
+			await this.writeSrcGain(n, (attrInt(this.state.src.get(n)?.INGN) ?? 0) + total)
 		})
 	}
 
@@ -672,6 +817,8 @@ export class XNodeOperations {
 	/** Enable, disable or toggle the stream (RTPE). */
 	async srcEnable(n: number, mode: 'on' | 'off' | 'toggle'): Promise<void> {
 		this.require('source')
+		if (mode !== 'on' && mode !== 'off' && mode !== 'toggle')
+			throw new Error(`Unknown stream enable mode "${String(mode)}"`)
 		await this.serial(async () => {
 			this.require('source')
 			this.index('SRC', n)
@@ -700,10 +847,13 @@ export class XNodeOperations {
 		await this.serial(async () => {
 			this.require('source')
 			this.index('SRC', n)
-			await this.send(formatCommand('SRC', [n], { RTPA: ip }), { verb: 'SRC', index: n })
+			// Keep a `;rtp-pt=97` style suffix of the current address.
+			const suffix = splitAddrSuffix(this.state.src.get(n)?.RTPA ?? '').suffix
+			const wanted = ip + suffix
+			await this.send(formatCommand('SRC', [n], { RTPA: wanted }), { verb: 'SRC', index: n })
 			const actual = this.state.src.get(n)?.RTPA ?? ''
-			if (normaliseAddr(actual) !== ip)
-				throw new Error(`SRC ${n}: the node did not apply RTPA ${ip} (reads ${actual || '?'})`)
+			if (normaliseAddr(actual) !== normaliseAddr(wanted))
+				throw new Error(`SRC ${n}: the node did not apply RTPA ${wanted} (reads ${actual || '?'})`)
 		})
 	}
 
