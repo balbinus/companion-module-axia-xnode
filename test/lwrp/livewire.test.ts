@@ -9,6 +9,7 @@ import {
 	normaliseAddr,
 	parseDstAddr,
 	parseKnownSources,
+	splitAddrSuffix,
 } from '../../src/lwrp/livewire.js'
 
 describe('isValidChannel', () => {
@@ -266,5 +267,22 @@ describe('parseKnownSources', () => {
 
 	it('rejects unicast addresses', () => {
 		expect(parseKnownSources('192.0.2.5=Unicast')).toEqual([])
+	})
+})
+
+describe('address suffix (xNode2 RTPA payload type)', () => {
+	it('splits the suffix off', () => {
+		expect(splitAddrSuffix('239.192.87.129;rtp-pt=97')).toEqual({ ip: '239.192.87.129', suffix: ';rtp-pt=97' })
+		expect(splitAddrSuffix('239.192.87.129')).toEqual({ ip: '239.192.87.129', suffix: '' })
+		expect(splitAddrSuffix('')).toEqual({ ip: '', suffix: '' })
+	})
+
+	it('ignores the suffix when parsing and normalising', () => {
+		expect(normaliseAddr('239.192.87.129;rtp-pt=97')).toBe('239.192.87.129')
+		expect(parseDstAddr('239.192.87.129;rtp-pt=97')).toMatchObject({
+			ip: '239.192.87.129',
+			channel: 22401,
+			kind: 'from',
+		})
 	})
 })

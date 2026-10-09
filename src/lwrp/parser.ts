@@ -59,10 +59,12 @@ export function parseLine(line: string): LwrpLine | null {
 	return { raw, verb, args: tokens, attrs }
 }
 
-/** Quote a string value for a command: strips `"`, `\` and control characters so it can never end the value or the line. */
+/**
+ * Quote a string value for a command. Keeps only printable ASCII and Latin-1 (the wire encoding) and drops `"` and `\`,
+ * so the value can never end itself or the line (chars above 0xFF would be truncated to their low byte when written).
+ */
 export function quote(value: string): string {
-	// eslint-disable-next-line no-control-regex
-	return `"${value.replace(/[\u0000-\u001f\u007f"\\]/g, '')}"`
+	return `"${value.replace(/[^\u0020-\u007e\u00a0-\u00ff]|["\\]/g, '')}"`
 }
 
 const SAFE_TOKEN_RE = /^[A-Za-z0-9_.\-/]+$/

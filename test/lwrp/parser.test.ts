@@ -161,6 +161,18 @@ describe('parseLine', () => {
 })
 
 describe('quote', () => {
+	it('strips characters above 0xFF that latin1 would truncate into CR, LF or a quote', () => {
+		expect(quote('a\u010db')).toBe('"ab"')
+		expect(quote('a\u020ab')).toBe('"ab"')
+		expect(quote('a\u0122b')).toBe('"ab"')
+		expect(quote('x\u{1F600}y')).toBe('"xy"')
+		expect(quote('x\ud800y')).toBe('"xy"')
+	})
+
+	it('keeps printable latin1 such as accents', () => {
+		expect(quote('R\u00e9gie \u00e0 5')).toBe('"R\u00e9gie \u00e0 5"')
+	})
+
 	it('wraps in double quotes', () => {
 		expect(quote('Studio 1')).toBe('"Studio 1"')
 		expect(quote('')).toBe('""')
@@ -308,5 +320,13 @@ describe('mixCommand', () => {
 
 	it('refuses gains that would be printed in exponent notation', () => {
 		expect(() => mixCommand(9, [[1, 1e21]])).toThrow(RangeError)
+	})
+})
+
+describe('formatCommand token checks', () => {
+	it('rejects tokens with characters latin1 would truncate', () => {
+		expect(() => formatCommand('SRC', ['1\u010d'])).toThrow(RangeError)
+		expect(() => formatCommand('S\u020aRC', [1])).toThrow(RangeError)
+		expect(() => formatCommand('SRC', [1], { 'A\u0122': 1 })).toThrow(RangeError)
 	})
 })

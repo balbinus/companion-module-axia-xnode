@@ -64,13 +64,19 @@ export interface ParsedAddr {
 	label?: string
 }
 
+/** Split an address value `239.192.87.129;rtp-pt=97` into its first token (IP or channel) and the `;…` suffix (kept verbatim, '' if none). */
+export function splitAddrSuffix(addr: string): { ip: string; suffix: string } {
+	const m = /^\s*([^\s;]*)(;\S*)?/.exec(addr)
+	return { ip: m?.[1] ?? '', suffix: m?.[2] ?? '' }
+}
+
 /** Parse a DST ADDR value: `""`, `239.192.87.30`, `22302`, `239.192.91.205 <Label>`, `239.192.91.205 Label`. */
 export function parseDstAddr(addr: string): ParsedAddr {
 	const raw = addr
 	const m = /^\s*(\S+)(?:\s+(.*?))?\s*$/.exec(addr)
 	if (!m) return { raw }
 	const result: ParsedAddr = { raw }
-	const head = m[1]
+	const head = splitAddrSuffix(m[1]).ip
 	if (isIpv4(head)) {
 		result.ip = head
 	} else if (/^\d+$/.test(head) && isValidChannel(Number(head))) {
