@@ -275,7 +275,19 @@ describe('completeness', () => {
 		const rig = makeCtrl(mock)
 		rig.ctrl.start()
 		await waitFor(() => rig.synced.length === 1)
-		expect(statusNames(rig)).toEqual(['connecting', 'connection_failure', 'connecting', 'ok'])
+		expect(statusNames(rig)).toEqual(['connecting', 'connection_failure', 'ok'])
+	})
+
+	it('a node that never answers IP/SET/CFG GPO still syncs completely and is not dropped', async () => {
+		const mock = await startMock({ dialect: 'xnode2' })
+		mock.delay(/^(IP|SET|CFG GPO)$/, 2000)
+		const rig = makeCtrl(mock, {}, { queryTimeoutMs: 60, listQuietMs: 20 })
+		rig.ctrl.start()
+		await waitFor(() => rig.synced.length === 1, { timeoutMs: 5000 })
+		expect(rig.synced).toEqual([true])
+		expect(statusNames(rig)).toEqual(['connecting', 'ok'])
+		expect(rig.ctrl.state.src.size).toBe(8)
+		expect(mock.connectionCount).toBe(1)
 	})
 })
 
@@ -342,6 +354,11 @@ describe('level alerts', () => {
 		await sleep(80)
 		expect(mock.lines('LVL')).toEqual([])
 		expect(ctrl.levelsReady).toBe(false)
+	})
+
+	it('levelAlerts undefined means on (the config default)', async () => {
+		const { mock } = await started('xnode2', { levelAlerts: undefined })
+		await waitFor(() => mock.lines('LVL').length > 0)
 	})
 
 	it('levelsReady drops to false when the connection is lost', async () => {
@@ -426,7 +443,7 @@ describe('heartbeat, reconnect, resync', () => {
 		const { mock, ctrl, statuses, synced } = await started('legacy')
 		mock.closeConnections()
 		await waitFor(() => synced.length === 2)
-		expect(statusNames({ statuses } as Rig)).toEqual(['connecting', 'ok', 'connection_failure', 'connecting', 'ok'])
+		expect(statusNames({ statuses } as Rig)).toEqual(['connecting', 'ok', 'connection_failure', 'ok'])
 		expect(ctrl.status).toBe('ok')
 		expect(mock.lines('LOGIN')).toEqual([])
 		expect(mock.lines('VER')).toHaveLength(2)
@@ -445,11 +462,12 @@ describe('heartbeat, reconnect, resync', () => {
 	it('backs off with growing delays while the node is down, then recovers', async () => {
 		const { mock, ctrl, statuses, synced } = await started('xnode2', {}, { backoffMs: [40, 90] })
 		await mock.down()
-		await waitFor(() => statuses.filter((s) => s.status === 'connecting').length >= 4, { timeoutMs: 5000 })
+		await waitFor(() => statuses.filter((s) => s.status === 'connection_failure').length >= 4, { timeoutMs: 5000 })
 		await waitFor(() => ctrl.status === 'connection_failure')
-		const attempts = statuses.filter((s) => s.status === 'connecting').map((s) => s.at)
-		expect(attempts[2] - attempts[1]).toBeGreaterThanOrEqual(35) // 40 ms
-		expect(attempts[3] - attempts[2]).toBeGreaterThanOrEqual(80) // 90 ms, repeats
+		const attempts = statuses.filter((s) => s.status === 'connection_failure').map((s) => s.at)
+		expect(attempts[2] - attempts[1]).toBeGreaterThanOrEqual(80) // 90 ms, repeats
+		expect(attempts[3] - attempts[2]).toBeGreaterThanOrEqual(80)
+		expect(statuses.filter((s) => s.status === 'connecting')).toHaveLength(1) // no flapping
 		expect(ctrl.status).toBe('connection_failure')
 		await mock.up()
 		await waitFor(() => ctrl.status === 'ok', { timeoutMs: 5000 })
@@ -488,7 +506,7 @@ describe('heartbeat, reconnect, resync', () => {
 				.join(' ')}`,
 		)
 		await waitFor(() => synced.length >= 2)
-		expect(statuses.some((s) => s.message === 'device identity changed')).toBe(true)
+		expect(statuses.some((s) => s.message?.startsWith('device identity changed') === true)).toBe(true)
 		expect(ctrl.state.nsrc).toBe(4)
 		expect(ctrl.state.src.size).toBe(4)
 	})
@@ -557,9 +575,10 @@ describe('heartbeat, reconnect, resync', () => {
 		await mock.down()
 		const rig = makeCtrl(mock)
 		rig.ctrl.start()
-		await waitFor(() => rig.statuses.filter((s) => s.status === 'connecting').length >= 3)
-		await waitFor(() => rig.ctrl.status === 'connection_failure')
+		await waitFor(() => rig.statuses.filter((s) => s.status === 'connection_failure').length >= 3)
+		expect(statusNames(rig).filter((s) => s === 'connecting')).toHaveLength(1)
 		expect(rig.statuses[1].status).toBe('connection_failure')
+		expect(rig.statuses[1].message).toMatch(/retrying in \d+ s/)
 		expect(rig.synced).toEqual([])
 	})
 })
@@ -825,6 +844,17 @@ describe('destroy', () => {
 		await sleep(40)
 		expect(changes.length).toBe(n)
 		expect(ctrl.state.dstName(1)).not.toBe('late')
+	})
+
+	it('emits nothing at all while being destroyed (no levels-not-ready change)', async () => {
+		const { ctrl } = await started('xnode2')
+		await waitFor(() => ctrl.levelsReady)
+		const events: string[] = []
+		ctrl.on('change', () => events.push('change'))
+		ctrl.on('status', () => events.push('status'))
+		ctrl.destroy()
+		await sleep(30)
+		expect(events).toEqual([])
 	})
 
 	it('stays stopped through stays() helper', async () => {

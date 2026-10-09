@@ -175,9 +175,10 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	destroy(): void {
 		if (this.destroyed) return
 		this.destroyed = true
+		// Listeners first: teardown emits (levels no longer ready) and nothing may reach the owner afterwards
+		this.removeAllListeners()
 		this.teardownSession()
 		clearTimeout(this.reconnectTimer)
-		this.removeAllListeners()
 	}
 
 	/**
@@ -218,7 +219,8 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private async connect(): Promise<void> {
 		if (this.destroyed) return
 		const id = ++this.sessionSeq
-		this.setStatus('connecting', `Connecting to ${this.config.host}:${this.config.port}`)
+		// Only the very first attempt shows 'connecting'; during an outage the status stays 'connection_failure'
+		if (this.attempt === 0) this.setStatus('connecting', `Connecting to ${this.config.host}:${this.config.port}`)
 		const conn = new LwrpConnection({
 			host: this.config.host.trim(),
 			port: this.config.port,
@@ -286,9 +288,9 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private dropSession(session: Session, reason: string): void {
 		if (this.session !== session || this.destroyed) return
 		this.teardownSession()
-		this.log('warn', `${reason}; reconnecting`)
-		this.setStatus('connection_failure', reason)
 		const delay = this.timings.backoffMs[Math.min(this.attempt, this.timings.backoffMs.length - 1)]
+		this.log('warn', `${reason}; reconnecting`)
+		this.setStatus('connection_failure', `${reason}; retrying in ${Math.max(1, Math.round(delay / 1000))} s`)
 		this.attempt++
 		clearTimeout(this.reconnectTimer)
 		this.reconnectTimer = setTimeout(() => void this.connect(), delay)
@@ -367,6 +369,7 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		cmd: string,
 		opts: Parameters<LwrpConnection['query']>[1] = {},
 		maxTimeouts = SYNC_MAX_TIMEOUTS,
+		optional = false,
 	): Promise<LwrpLine[] | null> {
 		try {
 			const lines = await conn.query(cmd, { timeoutMs: this.timings.queryTimeoutMs, ...opts })
@@ -375,7 +378,11 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		} catch (e) {
 			if (e instanceof LwrpError || e instanceof LwrpTimeoutError || e instanceof LwrpInvalidCommandError) {
 				this.log('debug', `query "${cmd}" failed: ${errMsg(e)}`)
-				if (e instanceof LwrpTimeoutError) {
+				if (e instanceof LwrpTimeoutError && optional) {
+					// Some nodes never answer these; only mandatory queries count towards the dead-link limits
+					// (the next mandatory query or the heartbeat catches a really dead link)
+					this.log('debug', `optional query "${cmd}" timed out; ignored`)
+				} else if (e instanceof LwrpTimeoutError) {
 					this.syncTotalTimeouts++
 					if (++this.syncTimeouts >= maxTimeouts || this.syncTotalTimeouts >= SYNC_MAX_TOTAL_TIMEOUTS)
 						throw new LwrpConnectionError(`no answer to ${this.syncTimeouts} consecutive queries`)
@@ -400,8 +407,8 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 			let complete = true
 			const quiet = this.timings.listQuietMs
 
-			await this.tryQuery(conn, 'IP', { expectCount: 2, quietMs: quiet })
-			await this.tryQuery(conn, 'SET')
+			await this.tryQuery(conn, 'IP', { expectCount: 2, quietMs: quiet }, SYNC_MAX_TIMEOUTS, true)
+			await this.tryQuery(conn, 'SET', {}, SYNC_MAX_TIMEOUTS, true)
 
 			const seen = new Map<string, Set<string>>()
 			const collect = async (
@@ -423,7 +430,7 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 			}
 			if (st.isXNode2 && st.ninp > 0) await collect('INP', 'INP')
 			if (st.ngpo > 0) {
-				await this.tryQuery(conn, 'CFG GPO')
+				await this.tryQuery(conn, 'CFG GPO', {}, SYNC_MAX_TIMEOUTS, true)
 				await this.tryQuery(conn, initial ? 'ADD GPO' : 'GPO')
 			}
 			if (st.ngpi > 0) await this.tryQuery(conn, initial ? 'ADD GPI' : 'GPI')
@@ -475,7 +482,8 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	}
 
 	private async subscribeLevels(session: Session): Promise<void> {
-		if (!this.config.levelAlerts) return
+		// undefined means on (the config default)
+		if (this.config.levelAlerts === false) return
 		this.levelChannels = this.computeLevelChannels()
 		if (this.levelChannels.length === 0) return
 		// One queued item: paced (xNode2 occasionally drops lines of bursts), holds the queue until the first

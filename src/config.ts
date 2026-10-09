@@ -79,7 +79,8 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			type: 'secret-text',
 			id: 'password',
 			label: 'LWRP password',
-			tooltip: 'Only sent (LOGIN) when a write permission below is enabled. Leave empty if the node has no password.',
+			tooltip:
+				'Sent (LOGIN) when a write permission below is enabled, and as HTTP Basic auth for the HTTP meter stream. Leave empty if the node has no password.',
 			width: 6,
 			default: '',
 		},

@@ -19,6 +19,17 @@ export type ModuleSchema = {
 
 export { UpgradeScripts }
 
+/** Runs async tasks strictly one after the other; a failing task never blocks the following ones. */
+export class SerialQueue {
+	private tail: Promise<unknown> = Promise.resolve()
+
+	async run<T>(task: () => Promise<T>): Promise<T> {
+		const result = this.tail.then(task, task)
+		this.tail = result.catch(() => undefined)
+		return result
+	}
+}
+
 const FLUSH_DEBOUNCE_MS = 100
 const REBUILD_DEBOUNCE_MS = 300
 
@@ -35,6 +46,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	controller!: XNodeController
 	ops!: XNodeOperations
 
+	private readonly lifecycle = new SerialQueue()
+	/** Set synchronously by destroy(): queued init/configUpdated work then does nothing */
+	private destroying = false
+	/** False while no device is running: late changes are dropped */
+	private running = false
 	private pending: StateChange[] = []
 	private flushTimer: NodeJS.Timeout | undefined
 	private rebuildTimer: NodeJS.Timeout | undefined
@@ -45,21 +61,29 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	async init(config: StoredConfig, _isFirstInit: boolean, secrets: ModuleSecrets | undefined): Promise<void> {
 		this.config = { ...config, password: secrets?.password ?? '' }
-		this.startDevice()
-		this.rebuildDefinitions()
+		await this.lifecycle.run(async () => {
+			if (this.destroying) return
+			this.startDevice()
+			this.rebuildDefinitions()
+		})
 	}
 
 	// When module gets deleted
 	async destroy(): Promise<void> {
 		this.log('debug', 'destroy')
-		await this.stopDevice()
+		this.destroying = true
+		await this.lifecycle.run(async () => this.stopDevice())
 	}
 
 	async configUpdated(config: StoredConfig, secrets: ModuleSecrets | undefined): Promise<void> {
-		await this.stopDevice()
-		this.config = { ...config, password: secrets?.password ?? '' }
-		this.startDevice()
-		this.rebuildDefinitions()
+		await this.lifecycle.run(async () => {
+			if (this.destroying) return
+			await this.stopDevice()
+			if (this.destroying) return // destroy() arrived while stopping: it wins
+			this.config = { ...config, password: secrets?.password ?? '' }
+			this.startDevice()
+			this.rebuildDefinitions()
+		})
 	}
 
 	// Return config fields for web config
@@ -92,10 +116,12 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.updateStatus(STATUS_MAP[status], message ?? null)
 		})
 		controller.on('change', (change) => this.queueChange(change))
+		this.running = true
 		controller.start()
 	}
 
 	private async stopDevice(): Promise<void> {
+		this.running = false
 		clearTimeout(this.flushTimer)
 		clearTimeout(this.rebuildTimer)
 		this.flushTimer = this.rebuildTimer = undefined
@@ -107,9 +133,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log('warn', `Shutdown: ${e instanceof Error ? e.message : String(e)}`)
 		}
 		this.controller?.destroy()
+		clearTimeout(this.flushTimer)
+		clearTimeout(this.rebuildTimer)
+		this.flushTimer = this.rebuildTimer = undefined
+		this.pending = []
 	}
 
 	private queueChange(change: StateChange): void {
+		if (!this.running) return
 		this.pending.push(change)
 		if (change.rebuild) {
 			clearTimeout(this.rebuildTimer)
@@ -120,6 +151,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	private flushChanges(): void {
 		this.flushTimer = undefined
+		if (!this.running) return
 		const changes = this.pending
 		this.pending = []
 		if (changes.length === 0) return
@@ -129,6 +161,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	private rebuildDefinitions(): void {
 		this.rebuildTimer = undefined
+		if (this.destroying) return
 		this.updateActions()
 		this.updateFeedbacks()
 		this.updateVariableDefinitions()
