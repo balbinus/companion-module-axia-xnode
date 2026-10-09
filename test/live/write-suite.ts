@@ -71,8 +71,8 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 					await restoreDevice(a, original)
 				}
 			} finally {
-				a?.close()
-				b?.close()
+				await a?.close()
+				await b?.close()
 				restoreSpy?.()
 			}
 		}, 40_000)
@@ -230,7 +230,7 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 				await expect(denied.mixSet([[outRow, 1]], 0)).rejects.toThrow(/disabled/)
 				await expect(denied.dstConnectAddress(dstN, '239.192.1.1')).rejects.toThrow(/disabled/)
 				await expect(denied.dstGainSet(dstN, 0)).rejects.toThrow(/disabled/)
-				denied.destroy()
+				await denied.destroy()
 				expect(sent.slice(since).filter((c) => /^(MIX|DST|SRC|GPO|INP)\b/.test(c) && /[:\d] ?[-\d]/.test(c))).toEqual(
 					[],
 				)
@@ -265,16 +265,13 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 				await ops.dstGainSet(dstN, 0)
 			}, 30_000)
 
-			// BUG: legacy nodes turn any DST OUGN below -72.0 dB into -100 dB (off), so the write is reported as not applied
-			;(xnode2 ? it : it.fails)(
-				'handles a destination gain below -72 dB',
-				async () => {
-					await a.ops.dstGainSet(dstN, -800)
-					expect(['-720', '-1000']).toContain(gainOf('dst', dstN))
-					if (xnode2) expect(gainOf('dst', dstN)).toBe('-720')
-				},
-				30_000,
-			)
+			it('handles a destination gain below -72 dB (xNode2 floor -72, legacy mutes)', async () => {
+				await a.ops.dstGainSet(dstN, -800)
+				expect(gainOf('dst', dstN)).toBe(xnode2 ? '-720' : '-1000')
+				await a.ops.dstGainSet(dstN, -720)
+				expect(gainOf('dst', dstN)).toBe('-720')
+				await a.ops.dstGainSet(dstN, 0)
+			}, 30_000)
 
 			it('refuses bad addresses and objects without sending', async () => {
 				const { ops } = a
@@ -303,16 +300,13 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 				await ops.srcGainSet(srcN, 0)
 			}, 30_000)
 
-			// BUG: legacy nodes turn any SRC INGN below -72.0 dB into -100 dB (off), so the write is reported as not applied
-			;(xnode2 ? it : it.fails)(
-				'handles a source gain below -72 dB',
-				async () => {
-					await a.ops.srcGainSet(srcN, -800)
-					expect(['-720', '-1000']).toContain(gainOf('src', srcN))
-					if (xnode2) expect(gainOf('src', srcN)).toBe('-720')
-				},
-				30_000,
-			)
+			it('handles a source gain below -72 dB (xNode2 floor -72, legacy mutes)', async () => {
+				await a.ops.srcGainSet(srcN, -800)
+				expect(gainOf('src', srcN)).toBe(xnode2 ? '-720' : '-1000')
+				await a.ops.srcGainSet(srcN, -720)
+				expect(gainOf('src', srcN)).toBe('-720')
+				await a.ops.srcGainSet(srcN, 0)
+			}, 30_000)
 
 			it('enables, disables and toggles the stream', async () => {
 				const { ops } = a
@@ -359,7 +353,7 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 				)
 				await expect(denied.srcGainSet(srcN, 0)).rejects.toThrow(/disabled/)
 				await expect(denied.srcEnable(srcN, 'off')).rejects.toThrow(/disabled/)
-				denied.destroy()
+				await denied.destroy()
 				expect(sentSince(since, 'SRC')).toEqual([])
 			}, 30_000)
 
@@ -466,7 +460,7 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 					() => undefined,
 				)
 				await expect(denied.gpoSet(port, [1], true)).rejects.toThrow(/disabled/)
-				denied.destroy()
+				await denied.destroy()
 				expect(sentSince(since, 'GPO')).toEqual([])
 			}, 30_000)
 
@@ -519,7 +513,7 @@ export function registerWriteSuite({ host, label, xnode2 }: SuiteOptions): void 
 					() => undefined,
 				)
 				await expect(denied.micGainSet(mic, 200)).rejects.toThrow(/disabled/)
-				denied.destroy()
+				await denied.destroy()
 				expect(sentSince(since, 'INP')).toEqual([])
 			}, 30_000)
 		})

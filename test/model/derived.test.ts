@@ -302,13 +302,17 @@ describe('variable values: SRC and DST', () => {
 		expect(v.dst_2_gain).toBe('0.0')
 	})
 
-	it('gain is empty when missing or garbage', () => {
+	it('an absent gain attribute on an existing SRC/DST means 0 dB; garbage is empty', () => {
 		const s = legacyA()
 		delete s.src.get(1)!.INGN
+		delete s.dst.get(1)!.OUGN
 		s.src.get(2)!.INGN = 'abc'
+		s.dst.get(2)!.OUGN = ''
 		const v = vals(s)
-		expect(v.src_1_gain).toBe('')
+		expect(v.src_1_gain).toBe('0.0')
+		expect(v.dst_1_gain).toBe('0.0')
 		expect(v.src_2_gain).toBe('')
+		expect(v.dst_2_gain).toBe('')
 	})
 
 	it('DST source_label and channel for every address form', () => {

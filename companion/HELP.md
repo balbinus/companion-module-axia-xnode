@@ -76,6 +76,7 @@ Buttons that write need the matching permission in the configuration, otherwise 
 ## Safety
 
 - Everything is validated and clamped before it is sent. Gains are sent as integer tenths of a dB.
+- Source input gain and destination output gain: -100 to +24 dB. Below -72 dB the nodes behave differently: legacy nodes store any lower value as -100 dB (mute), and xNode2 refuses it, so the module sends -72 dB there. An absent gain on a legacy node means 0 dB.
 - Crosspoints: the node has a budget of **220** crosspoints; the module refuses writes beyond it. Crosspoint gain stays within the configured limits.
 - SRC input / DST output gain: -100 to +24 dB; **xNode2 refuses anything below -72 dB**, so the module stops there.
 - Microphone gain: the node accepts **0 dB or 14 to 69 dB**; other values are snapped (stepping down from 14 dB goes to 0).

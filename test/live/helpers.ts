@@ -47,7 +47,7 @@ export interface Rig {
 	ops: XNodeOperations
 	config: ModuleConfig
 	logs: string[]
-	close(): void
+	close(): Promise<void>
 }
 
 /** Controller + operations against a real node; resolves once the first sync finished. */
@@ -74,9 +74,12 @@ export async function connectRig(
 		ops,
 		config,
 		logs,
-		close() {
-			ops.destroy()
-			ctrl.destroy()
+		async close() {
+			try {
+				await ops.destroy()
+			} finally {
+				ctrl.destroy()
+			}
 		},
 	}
 }
@@ -192,6 +195,6 @@ export async function freshSnapshot(host: string): Promise<DeviceSnapshot> {
 	try {
 		return snapshotDevice(rig.ctrl.state)
 	} finally {
-		rig.close()
+		await rig.close()
 	}
 }

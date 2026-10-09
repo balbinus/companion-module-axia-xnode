@@ -188,7 +188,9 @@ function setPeaks(out: VarValues, id: string, state: XNodeState, group: MeterKin
 	if (stereo) out[`${id}_peak_r`] = peakDb(m?.r)
 }
 
-function gainText(raw: string | undefined): string {
+/** `exists`: the object is known; an absent gain attribute then means 0 dB (legacy nodes omit it until set once). */
+function gainText(raw: string | undefined, exists = false): string {
+	if (raw === undefined && exists) return formatDb(0)
 	if (raw === undefined || raw === '' || !Number.isFinite(Number(raw))) return ''
 	return formatDb(Number(raw))
 }
@@ -240,7 +242,7 @@ export function computeVariableValues(state: XNodeState, config: DerivedConfig, 
 		v[`src_${n}_address`] = a.RTPA ?? ''
 		v[`src_${n}_channel`] = parseDstAddr(addr).channel ?? ''
 		v[`src_${n}_mode`] = srcModeLabel(a.RTPP)
-		v[`src_${n}_gain`] = gainText(a.INGN)
+		v[`src_${n}_gain`] = gainText(a.INGN, state.src.has(n))
 		if (signals) v[`src_${n}_signal`] = signalState(state.lvl.ICH.get(n), levelsReady)
 		if (meters) setPeaks(v, `src_${n}`, state, 'ICH', n, true)
 	}
@@ -252,7 +254,7 @@ export function computeVariableValues(state: XNodeState, config: DerivedConfig, 
 		v[`dst_${n}_address`] = addr
 		v[`dst_${n}_channel`] = p.channel ?? ''
 		v[`dst_${n}_source_label`] = p.label ?? p.channel ?? p.ip ?? ''
-		v[`dst_${n}_gain`] = gainText(a.OUGN)
+		v[`dst_${n}_gain`] = gainText(a.OUGN, state.dst.has(n))
 		if (signals) v[`dst_${n}_signal`] = signalState(state.lvl.OCH.get(n), levelsReady)
 		if (meters) setPeaks(v, `dst_${n}`, state, 'OCH', n, true)
 	}

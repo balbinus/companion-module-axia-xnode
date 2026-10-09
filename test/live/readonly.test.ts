@@ -54,8 +54,8 @@ for (const [label, host, xnode2] of targets) {
 			rig.ctrl.on('synced', () => syncedEvents++)
 		}, 30_000)
 
-		afterAll(() => {
-			rig?.close()
+		afterAll(async () => {
+			await rig?.close()
 			restoreSpy?.()
 		})
 
@@ -155,8 +155,7 @@ for (const [label, host, xnode2] of targets) {
 			if (xnode2) expect(evaluateGpioActive(st.gpo.get(1), 1)).toBe(st.gpo.get(1)?.[0] === 'l')
 		})
 
-		// BUG: a legacy node omits SRC INGN until it was set once (default 0), and src_N_gain stays blank instead of 0.0
-		;(host === LEGACY_HOST ? it.fails : it)('shows 0.0 as the source gain when INGN was never set', () => {
+		it('shows 0.0 as the source gain when INGN was never set', () => {
 			const st = rig.ctrl.state
 			const vars = computeVariableValues(st, READ_ONLY, true)
 			for (let n = 1; n <= st.nsrc; n++) expect(vars[`src_${n}_gain`], `SRC ${n}`).toMatch(/^(0\.0|[+-]\d+\.\d)$/)

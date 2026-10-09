@@ -246,10 +246,14 @@ export class XNodeOperations {
 		return value
 	}
 
-	/** SRC INGN / DST OUGN clamp. xNode2 rejects (ERROR 1001) anything below -72 dB, legacy nodes accept down to -100 dB. */
+	/**
+	 * SRC INGN / DST OUGN clamp. xNode2 rejects (ERROR 1001) anything below -72 dB, so it is clamped to -72.
+	 * Legacy nodes store any value below -72 dB as -100 dB (mute), so that is what is sent.
+	 */
 	private clampDeviceGain(tenths: number): number {
 		const value = clampGain(tenths)
-		return this.state.isXNode2 ? Math.max(value, XNODE2_GAIN_MIN_TENTHS) : value
+		if (value >= XNODE2_GAIN_MIN_TENTHS) return value
+		return this.state.isXNode2 ? XNODE2_GAIN_MIN_TENTHS : GAIN_MIN_TENTHS
 	}
 
 	/** Crosspoint limits in tenths, sanitised: inside -100...+24 dB and min < max. */
