@@ -6,7 +6,7 @@ User documentation: [companion/HELP.md](./companion/HELP.md). Licence: [MIT](./L
 
 ## Development
 
-Requires Node (see `engines` in `package.json`) and Yarn 4.
+Requires Node (see `engines` in `package.json`) and Yarn 4. The manifest targets the node26 runtime (`engines` is `^26`), but local development, tests and builds work on Node 22; Yarn may print an engines warning there, which can be ignored.
 
 ```sh
 yarn            # install dependencies

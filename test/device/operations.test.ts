@@ -382,6 +382,7 @@ describe('mixer: wire format and index validation', () => {
 			r.state.reset()
 			apply(r.state, 'VER LWRP:1.2 DEVN:"axiaxnode.future" NSRC:8 NDST:8 MIX:24')
 			apply(r.state, 'MIXCFG MODE:0')
+			for (let o = 1; o <= 24; o++) apply(r.state, `MIX ${o} `)
 			await r.ops.mixSet([[24, 24]], 0)
 			await expect(r.ops.mixSet([[24, 25]], 0)).rejects.toThrow(/input 25/)
 		})
@@ -431,6 +432,15 @@ describe('mixer: wire format and index validation', () => {
 	})
 
 	describe('crosspoint budget (220)', () => {
+		it('refuses adding crosspoints while a mixer row is unknown, but allows clears', async () => {
+			const r = rig()
+			r.state.mix.delete(5)
+			await expect(r.ops.mixSet([[1, 1]], 0)).rejects.toThrow(/not been fully read/)
+			expect(r.ctl.commands).toEqual([])
+			apply(r.state, 'MIX 1 1:0')
+			await r.ops.mixClear([[1, 1]])
+			expect(r.ctl.commands).toEqual(['MIX 1 1:-'])
+		})
 		it('allows reaching exactly 220, refuses the 221st', async () => {
 			const r = rig()
 			fillBudget(r.state, 219)
@@ -684,11 +694,12 @@ describe('mixer: adjust (coalesced)', () => {
 		expect(r.ctl.commands).toHaveLength(1)
 	})
 
-	it('destroy drops pending adjusts without writing and resolves the waiters', async () => {
+	it('destroy drops pending adjusts without writing and rejects the waiters as cancelled', async () => {
 		const r = rig()
 		const p = r.ops.mixAdjust([[12, 10]], 10)
+		const assertion = expect(p).rejects.toThrow(/Cancelled/)
 		await r.ops.destroy()
-		await expect(p).resolves.toBeUndefined()
+		await assertion
 		await vi.advanceTimersByTimeAsync(200)
 		expect(r.ctl.commands).toEqual([])
 	})
@@ -1272,6 +1283,38 @@ describe('DST', () => {
 			await r.ops.dstGainSet(4, 999)
 			expect(r.ctl.commands).toEqual(['DST 1 OUGN:-720', 'DST 2 OUGN:-720', 'DST 3 OUGN:-719', 'DST 4 OUGN:240'])
 		})
+		describe('adjust from the floor', () => {
+			beforeEach(() => {
+				vi.useFakeTimers()
+			})
+			afterEach(() => {
+				vi.useRealTimers()
+			})
+			it('adjusting up from the -72 dB floor or the legacy mute starts at -72 dB', async () => {
+				const l = rig()
+				apply(l.state, 'DST 1 OUGN:-1000')
+				apply(l.state, 'DST 2 OUGN:-720')
+				apply(l.state, 'DST 3 OUGN:-1000')
+				const ps = [l.ops.dstGainAdjust(1, 10), l.ops.dstGainAdjust(2, 20), l.ops.dstGainAdjust(3, -10)]
+				await vi.advanceTimersByTimeAsync(100)
+				await Promise.all(ps)
+				expect(l.ctl.commands).toEqual(['DST 1 OUGN:-710', 'DST 2 OUGN:-700'])
+			})
+			it('adjusting down below -72 dB mutes on legacy and stops at -72 on xNode2', async () => {
+				const l = rig()
+				apply(l.state, 'SRC 1 INGN:-715')
+				const p = l.ops.srcGainAdjust(1, -10)
+				await vi.advanceTimersByTimeAsync(100)
+				await p
+				expect(l.ctl.commands).toEqual(['SRC 1 INGN:-1000'])
+				const x = rig('xnode2-combo')
+				apply(x.state, 'SRC 1 INGN:-715')
+				const q = x.ops.srcGainAdjust(1, -10)
+				await vi.advanceTimersByTimeAsync(100)
+				await q
+				expect(x.ctl.commands).toEqual(['SRC 1 INGN:-720'])
+			})
+		})
 		it('refuses non-integers and writes nothing when already at the value', async () => {
 			const r = rig()
 			await expect(r.ops.dstGainSet(1, 0.5)).rejects.toThrow(/integer/)
@@ -1432,6 +1475,15 @@ describe('SRC', () => {
 			const r = rigWithGain()
 			await r.ops.srcRename(1, '1234567890"123456')
 			expect(r.ctl.commands).toEqual(['SRC 1 PSNM:"1234567890123456"'])
+		})
+		it('removes characters the wire cannot carry before the empty and length checks', async () => {
+			const r = rigWithGain()
+			await expect(r.ops.srcRename(1, '\u4e2d\u6587')).rejects.toThrow(/empty/)
+			await r.ops.srcRename(1, 'Caf\u00e9 \u4e2d')
+			expect(r.ctl.commands).toEqual(['SRC 1 PSNM:"Caf\u00e9"'])
+			expect(r.state.src.get(1)?.PSNM).toBe('Caf\u00e9')
+			await r.ops.srcRename(1, '12345678901234\u4e2d\u4e2d56')
+			expect(r.ctl.commands[1]).toBe('SRC 1 PSNM:"1234567890123456"')
 		})
 		it('tolerates non-string input', async () => {
 			const r = rigWithGain()
@@ -1658,7 +1710,7 @@ describe('latest value wins for absolute sets', () => {
 		expect(r.ctl.commands).toEqual(['DST 2 OUGN:1', 'DST 1 OUGN:10', 'DST 2 OUGN:20', 'DST 1 OUGN:30'])
 	})
 
-	it('toggle is decided from the state when it runs, repeated presses collapse', async () => {
+	it('toggle is never coalesced: every press is one toggle, decided from the state at execution time', async () => {
 		const r = rig()
 		const g = gate(r)
 		const first = r.ops.mixSet([[9, 1]], 0)
@@ -1666,8 +1718,8 @@ describe('latest value wins for absolute sets', () => {
 		const ps = [first, r.ops.mixToggle([[9, 1]], -30), r.ops.mixToggle([[9, 1]], -30), r.ops.mixToggle([[9, 1]], -30)]
 		g.release()
 		await Promise.all(ps)
-		// the toggle saw the crosspoint on (written by the set before it) and cleared it
-		expect(r.ctl.commands).toEqual(['MIX 9 1:0', 'MIX 9 1:-'])
+		// set -> on; toggles: off, on, off
+		expect(r.ctl.commands).toEqual(['MIX 9 1:0', 'MIX 9 1:-', 'MIX 9 1:-30', 'MIX 9 1:-'])
 	})
 
 	it('exclusive collapses and a failure reaches every waiter', async () => {

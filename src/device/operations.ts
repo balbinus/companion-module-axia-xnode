@@ -49,8 +49,8 @@ export const PULSE_RESTORE_MAX_ATTEMPTS = 90
 /** destroy() waits at most this long for the final pulse restore. */
 export const DESTROY_RESTORE_TIMEOUT_MS = 2500
 
-// eslint-disable-next-line no-control-regex
-const UNSAFE_CHARS = /[\u0000-\u001f\u007f"\\]/g
+/** Same character set as quote(): printable ASCII and Latin-1, minus `"` and `\`. */
+const UNSAFE_CHARS = /[^\u0020-\u007e\u00a0-\u00ff]|["\\]/g
 const DEFAULT_XP_MIN_DB = -80
 const DEFAULT_XP_MAX_DB = 24
 
@@ -132,7 +132,7 @@ export class XNodeOperations {
 		this.destroyed = true
 		for (const p of this.adjusts.values()) {
 			clearTimeout(p.timer)
-			for (const w of p.waiters) w.resolve()
+			for (const w of p.waiters) w.reject(new Error('Cancelled: the module is shutting down'))
 		}
 		this.adjusts.clear()
 		const active = [...this.pulses.entries()]
@@ -256,6 +256,16 @@ export class XNodeOperations {
 		return this.state.isXNode2 ? XNODE2_GAIN_MIN_TENTHS : GAIN_MIN_TENTHS
 	}
 
+	/**
+	 * Gain after adding `total` to the current device gain (absent = 0 dB on legacy). Adjusting up from the -72 dB
+	 * floor or below (including the legacy mute, -100 dB) starts from the floor, so mute can be left with one step.
+	 */
+	private adjustedGain(current: number | undefined, total: number): number {
+		const base = current ?? 0
+		if (total > 0 && base <= XNODE2_GAIN_MIN_TENTHS) return XNODE2_GAIN_MIN_TENTHS + total
+		return base + total
+	}
+
 	/** Crosspoint limits in tenths, sanitised: inside -100...+24 dB and min < max. */
 	xpointLimits(): { min: number; max: number } {
 		const cfg = this.getConfig()
@@ -285,7 +295,7 @@ export class XNodeOperations {
 						this.adjusts.delete(key)
 						const total = created.delta
 						this.serial(async () => {
-							if (this.destroyed) return
+							if (this.destroyed) throw new Error('Cancelled: the module is shutting down')
 							await created.flush(total)
 						}).then(
 							() => created.waiters.forEach((w) => w.resolve()),
@@ -349,6 +359,15 @@ export class XNodeOperations {
 			delta += (value !== null ? 1 : 0) - (isXpointOn(st.getXpoint(out, inp)) ? 1 : 0)
 		}
 		const used = st.xpointsUsed()
+		if (delta > 0) {
+			const unknown: number[] = []
+			for (let r = 1; r <= st.nmix; r++) if (!st.mix.has(r)) unknown.push(r)
+			if (unknown.length > 0) {
+				throw new Error(
+					`The mixer has not been fully read yet (${unknown.length} of ${st.nmix} rows unknown), so the crosspoint budget cannot be checked; adding crosspoints is refused until it is`,
+				)
+			}
+		}
 		if (delta > 0 && used + delta > XPOINT_BUDGET) {
 			throw new Error(
 				`Crosspoint budget exceeded: ${used} in use, this change adds ${delta}, the node allows ${XPOINT_BUDGET}`,
@@ -396,12 +415,12 @@ export class XNodeOperations {
 
 	/**
 	 * All target crosspoints on -> clear all; otherwise set all at `onTenths`. Decided from the state when the write
-	 * runs. Several presses queued behind a busy write collapse into one toggle.
+	 * runs. Not coalesced: every press is one toggle, executed in order.
 	 */
 	async mixToggle(xpoints: Array<[number, number]>, onTenths: number): Promise<void> {
 		this.require('mixer')
 		XNodeOperations.integer(onTenths, 'Crosspoint gain')
-		await this.latestWins(`mixtoggle:${xpoints.map(([o, i]) => `${o}/${i}`).join(',')}`, async () => {
+		await this.serial(async () => {
 			const allOn = xpoints.length > 0 && xpoints.every(([o, i]) => isXpointOn(this.state.getXpoint(o, i)))
 			return this.writeXpoints(xpoints.map(([o, i]) => [o, i, allOn ? null : onTenths]))
 		})
@@ -778,7 +797,7 @@ export class XNodeOperations {
 		this.index('DST', n)
 		await this.coalesce(`dst:${n}`, deltaTenths, async (total) => {
 			// Legacy nodes may omit OUGN: absent means 0 dB.
-			await this.writeDstGain(n, (attrInt(this.state.dst.get(n)?.OUGN) ?? 0) + total)
+			await this.writeDstGain(n, this.adjustedGain(attrInt(this.state.dst.get(n)?.OUGN), total))
 		})
 	}
 
@@ -805,7 +824,7 @@ export class XNodeOperations {
 		this.index('SRC', n)
 		await this.coalesce(`src:${n}`, deltaTenths, async (total) => {
 			// Legacy nodes may omit INGN: absent means 0 dB.
-			await this.writeSrcGain(n, (attrInt(this.state.src.get(n)?.INGN) ?? 0) + total)
+			await this.writeSrcGain(n, this.adjustedGain(attrInt(this.state.src.get(n)?.INGN), total))
 		})
 	}
 

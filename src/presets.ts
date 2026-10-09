@@ -99,22 +99,33 @@ function indicator(name: string, st: CompanionButtonStyleProps, feedbacks: Feedb
 const levelOptions = (
 	level: { group: 'ICH' | 'OCH' | 'HWI' | 'HWO'; n: number },
 	condition: 'present' | 'silence' | 'clip',
-): Extract<Feedback, { feedbackId: 'level_state' }>['options'] => ({
-	group: level.group,
-	src: level.group === 'ICH' ? level.n : 1,
-	dst: level.group === 'OCH' ? level.n : 1,
-	hwi: level.group === 'HWI' ? level.n : 1,
-	hwo: level.group === 'HWO' ? level.n : 1,
-	side: 'either',
-	condition,
-})
+	physical: boolean,
+): Extract<Feedback, { feedbackId: 'level_state' }>['options'] =>
+	({
+		group: level.group,
+		src: level.group === 'ICH' ? level.n : 1,
+		dst: level.group === 'OCH' ? level.n : 1,
+		// hwi / hwo are only declared by the feedback on xNode2
+		...(physical ? { hwi: level.group === 'HWI' ? level.n : 1, hwo: level.group === 'HWO' ? level.n : 1 } : {}),
+		side: 'either',
+		condition,
+	}) as Extract<Feedback, { feedbackId: 'level_state' }>['options']
 
 /** Signal indicator: green when audio is present, dim amber on silence, red on clipping */
-function signalButton(name: string, text: string, level: { group: 'ICH' | 'OCH' | 'HWI' | 'HWO'; n: number }): Preset {
+function signalButton(
+	name: string,
+	text: string,
+	level: { group: 'ICH' | 'OCH' | 'HWI' | 'HWO'; n: number },
+	physical: boolean,
+): Preset {
 	return indicator(name, style(text), [
-		{ feedbackId: 'level_state', options: levelOptions(level, 'silence'), style: { bgcolor: DIM_AMBER, color: WHITE } },
-		{ feedbackId: 'level_state', options: levelOptions(level, 'present'), style: onGreen },
-		{ feedbackId: 'level_state', options: levelOptions(level, 'clip'), style: onRed },
+		{
+			feedbackId: 'level_state',
+			options: levelOptions(level, 'silence', physical),
+			style: { bgcolor: DIM_AMBER, color: WHITE },
+		},
+		{ feedbackId: 'level_state', options: levelOptions(level, 'present', physical), style: onGreen },
+		{ feedbackId: 'level_state', options: levelOptions(level, 'clip', physical), style: onRed },
 	])
 }
 
@@ -248,14 +259,10 @@ function gainPresets(b: PresetBuilder, self: ModuleInstance, t: GainTarget): str
 		t.kind === 'dst'
 			? { actionId: 'dst_gain_adjust', options: { dst: t.n, step } }
 			: { actionId: 'src_gain_adjust', options: { src: t.n, step } }
-	const reset: Action =
-		t.kind === 'dst'
-			? { actionId: 'dst_gain_set', options: { dst: t.n, gain: 0 } }
-			: { actionId: 'src_gain_set', options: { src: t.n, gain: 0 } }
 	const id = `gain_${t.kind}_${t.n}`
 	return [
 		b.add(`${id}_down`, pressButton(`${title} gain -1 dB`, style('-1 dB', 18), [adjust(-1)])),
-		b.add(`${id}_value`, pressButton(`${title} gain (press: 0 dB)`, style(`${title}\\n${gainVar} dB`), [reset])),
+		b.add(`${id}_value`, indicator(`${title} gain`, style(`${title}\\n${gainVar} dB`), [])),
 		b.add(`${id}_up`, pressButton(`${title} gain +1 dB`, style('+1 dB', 18), [adjust(1)])),
 	]
 }
@@ -268,13 +275,13 @@ function addGains(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 	b.section(
 		'gain_dst',
 		'Gain → destinations (DST output gain)',
-		'-1 dB / current value (press: reset to 0 dB) / +1 dB. Needs "Allow mixer & routing changes". xNode2 floor: -72 dB.',
+		'-1 dB / current value (display only) / +1 dB. Needs "Allow mixer & routing changes". xNode2 floor: -72 dB.',
 		groups(targets('dst', state.ndst)),
 	)
 	b.section(
 		'gain_src',
 		'Gain → sources (SRC input gain)',
-		'-1 dB / current value (press: reset to 0 dB) / +1 dB. Needs "Allow source (stream) changes".',
+		'-1 dB / current value (display only) / +1 dB. Needs "Allow source (stream) changes".',
 		groups(targets('src', state.nsrc)),
 	)
 
@@ -403,6 +410,7 @@ function addStatus(b: PresetBuilder, self: ModuleInstance, state: XNodeState, kn
 						`${kind.toUpperCase()} ${n} signal`,
 						`${kind.toUpperCase()} ${n}\\n$(${l}:${kind}_${n}_name)\\n$(${l}:${kind}_${n}_signal)`,
 						{ group: group_, n },
+						state.isXNode2,
 					),
 				),
 			)
@@ -423,10 +431,15 @@ function addStatus(b: PresetBuilder, self: ModuleInstance, state: XNodeState, kn
 				const ids = physPorts(state, dir).map((p) =>
 					b.add(
 						`sig_${prefix}_${p.n}`,
-						signalButton(`${word} ${p.label} signal`, `${stacked(p.label)}\\n$(${l}:${prefix}_${p.n}_signal)`, {
-							group: g,
-							n: p.n,
-						}),
+						signalButton(
+							`${word} ${p.label} signal`,
+							`${stacked(p.label)}\\n$(${l}:${prefix}_${p.n}_signal)`,
+							{
+								group: g,
+								n: p.n,
+							},
+							true,
+						),
 					),
 				)
 				groups.push(group(`status_${prefix}`, `Signal → physical ${word.toLowerCase()}s`, ids))
@@ -435,7 +448,7 @@ function addStatus(b: PresetBuilder, self: ModuleInstance, state: XNodeState, kn
 	}
 	b.section('status', 'Status', 'Read-only indicators: device, mixer and signal state.', groups)
 
-	// SRC stream indicator
+	// SRC stream on/off buttons (they write, so they are not part of the read-only Status section)
 	if (state.nsrc > 0) {
 		const ids = Array.from({ length: state.nsrc }, (_, i) => i + 1).map((n) =>
 			b.add(
@@ -450,7 +463,7 @@ function addStatus(b: PresetBuilder, self: ModuleInstance, state: XNodeState, kn
 		)
 		b.section(
 			'src_streams',
-			'SRC streams',
+			'Sources → stream on/off',
 			'Green: stream enabled. Pressing toggles the stream and needs "Allow source (stream) changes".',
 			[group('src_streams', 'SRC streams', ids)],
 		)
@@ -564,7 +577,7 @@ export function UpdatePresets(self: ModuleInstance): void {
 	addStatus(b, self, state, known)
 
 	// Keep the device / status section first
-	const status = b.sections.filter((s) => s.id === 'status' || s.id === 'src_streams')
+	const status = b.sections.filter((s) => s.id === 'status')
 	const rest = b.sections.filter((s) => !status.includes(s))
 	self.setPresetDefinitions([...status, ...rest], b.presets)
 }
