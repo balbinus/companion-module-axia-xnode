@@ -22,9 +22,10 @@ export function tenthsToDb(tenths: number): number {
 	return tenths / 10
 }
 
-/** Clamp tenths to the SRC INGN / DST OUGN range. */
+/** Clamp tenths to the SRC INGN / DST OUGN range. NaN becomes 0 (unity), and -0 never comes out. */
 export function clampGain(tenths: number): number {
-	return clamp(Math.round(tenths), GAIN_MIN_TENTHS, GAIN_MAX_TENTHS)
+	if (Number.isNaN(tenths)) return 0
+	return clamp(Math.round(tenths), GAIN_MIN_TENTHS, GAIN_MAX_TENTHS) || 0
 }
 
 export function isXpointOn(tenths: number | undefined): boolean {
@@ -33,6 +34,7 @@ export function isXpointOn(tenths: number | undefined): boolean {
 
 /** Tenths to a one-decimal string with an explicit "+" for positive values: -60 -> "-6.0", 35 -> "+3.5", 0 -> "0.0". */
 export function formatDb(tenths: number): string {
+	if (Number.isNaN(tenths)) return '-'
 	const abs = Math.abs(Math.round(tenths))
 	const text = `${Math.floor(abs / 10)}.${abs % 10}`
 	if (abs === 0) return text

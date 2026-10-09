@@ -74,48 +74,65 @@ function parseLwrpVersion(v: string | undefined): [number, number] {
 }
 
 export class XNodeState implements NameLookup {
-	ver: Attrs = {}
-	isXNode2 = false
-	hasMixer = false
-	nsrc = 0
-	ndst = 0
+	ver!: Attrs
+	isXNode2!: boolean
+	hasMixer!: boolean
+	nsrc!: number
+	ndst!: number
 	/** Number of mixer rows (VER MIX) */
-	nmix = 0
-	ngpi = 0
-	ngpo = 0
+	nmix!: number
+	ngpi!: number
+	ngpo!: number
 	/** Number of INP objects; always 0 on legacy nodes (their VER INP is bogus) */
-	ninp = 0
-	ioMap: MixIoMap = buildIoMap({})
+	ninp!: number
+	ioMap!: MixIoMap
 
-	ip: IpInfo = {}
-	set: Attrs = {}
-	src = new Map<number, Attrs>()
-	dst = new Map<number, Attrs>()
+	ip!: IpInfo
+	set!: Attrs
+	src!: Map<number, Attrs>
+	dst!: Map<number, Attrs>
 	/** output -> (input -> tenths); inputs that are off are absent */
-	mix = new Map<number, Map<number, number>>()
-	mixcfgMode: number | undefined
-	inp = new Map<number, Attrs>()
-	gpi = new Map<number, string>()
-	gpo = new Map<number, string>()
-	cfgGpo = new Map<number, Attrs>()
-	lvl: Record<MeterKind, Map<number, Partial<Record<LevelSide, LevelState>>>> = {
-		ICH: new Map(),
-		OCH: new Map(),
-		HWI: new Map(),
-		HWO: new Map(),
-	}
-	mtr: Record<MeterKind, Map<number, MeterReading>> = {
-		ICH: new Map(),
-		OCH: new Map(),
-		HWI: new Map(),
-		HWO: new Map(),
+	mix!: Map<number, Map<number, number>>
+	mixcfgMode!: number | undefined
+	inp!: Map<number, Attrs>
+	gpi!: Map<number, string>
+	gpo!: Map<number, string>
+	cfgGpo!: Map<number, Attrs>
+	lvl!: Record<MeterKind, Map<number, Partial<Record<LevelSide, LevelState>>>>
+	mtr!: Record<MeterKind, Map<number, MeterReading>>
+
+	constructor(private readonly now: () => number = Date.now) {
+		this.init()
 	}
 
-	constructor(private readonly now: () => number = Date.now) {}
-
+	/** Forget everything learned from the device (new connection). */
 	reset(): void {
-		const fresh = new XNodeState(this.now)
-		Object.assign(this, { ...fresh, now: this.now })
+		this.init()
+	}
+
+	private init(): void {
+		this.ver = {}
+		this.isXNode2 = false
+		this.hasMixer = false
+		this.nsrc = 0
+		this.ndst = 0
+		this.nmix = 0
+		this.ngpi = 0
+		this.ngpo = 0
+		this.ninp = 0
+		this.ioMap = buildIoMap({})
+		this.ip = {}
+		this.set = {}
+		this.src = new Map()
+		this.dst = new Map()
+		this.mix = new Map()
+		this.mixcfgMode = undefined
+		this.inp = new Map()
+		this.gpi = new Map()
+		this.gpo = new Map()
+		this.cfgGpo = new Map()
+		this.lvl = { ICH: new Map(), OCH: new Map(), HWI: new Map(), HWO: new Map() }
+		this.mtr = { ICH: new Map(), OCH: new Map(), HWI: new Map(), HWO: new Map() }
 	}
 
 	srcName(n: number): string | undefined {
@@ -234,7 +251,7 @@ export class XNodeState implements NameLookup {
 		const row = new Map<number, number>()
 		for (const [key, value] of Object.entries(attrs)) {
 			const input = index(key)
-			if (input === null || value === '-') continue
+			if (input === null || value === '' || value === '-') continue
 			const tenths = Number(value)
 			if (!Number.isInteger(tenths) || tenths <= XPOINT_OFF_TENTHS - 1) continue
 			row.set(input, tenths)

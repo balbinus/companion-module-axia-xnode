@@ -152,10 +152,11 @@ describe('parseLine', () => {
 		}
 	})
 
-	// BUG: an error text containing "word:" is mistaken for an attribute (ERROR 1000 bad command: foo)
-	it.fails('does not turn colons in free text of an ERROR line into attributes', () => {
+	it('does not turn colons in free text of an ERROR line into attributes', () => {
 		const p = parsed('ERROR 1000 bad command: foo')
 		expect(p.attrs).toEqual({})
+		expect(p.args).toEqual(['1000', 'bad', 'command:', 'foo'])
+		expect(p.args.slice(1).join(' ')).toBe('bad command: foo')
 	})
 })
 
@@ -247,8 +248,7 @@ describe('formatCommand', () => {
 		expect(formatCommand('SRC', [1], { INGN: -0 })).toBe('SRC 1 INGN:0')
 	})
 
-	// BUG: huge integers pass the integer check but are printed in exponent notation (INGN:1e+21)
-	it.fails('refuses integers that would be printed in exponent notation', () => {
+	it('refuses integers that would be printed in exponent notation', () => {
 		expect(() => formatCommand('SRC', [1], { INGN: 1e21 })).toThrow(RangeError)
 	})
 })
@@ -300,15 +300,13 @@ describe('mixCommand', () => {
 		expect(mixCommand(9, [[1, -0]])).toBe('MIX 9 1:0')
 	})
 
-	// BUG: the output row is not validated as a positive integer (MIX 1.5 / MIX -3 / MIX 0 are produced)
-	it.fails('refuses non-integer or non-positive output rows', () => {
+	it('refuses non-integer or non-positive output rows', () => {
 		expect(() => mixCommand(1.5, [[1, 0]])).toThrow(RangeError)
 		expect(() => mixCommand(-3, [[1, 0]])).toThrow(RangeError)
 		expect(() => mixCommand(0, [[1, 0]])).toThrow(RangeError)
 	})
 
-	// BUG: huge integer gain is printed in exponent notation (1:1e+21)
-	it.fails('refuses gains that would be printed in exponent notation', () => {
+	it('refuses gains that would be printed in exponent notation', () => {
 		expect(() => mixCommand(9, [[1, 1e21]])).toThrow(RangeError)
 	})
 })

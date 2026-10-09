@@ -118,8 +118,7 @@ describe('isIpv4 / isIpv4Multicast', () => {
 		}
 	})
 
-	// BUG: octets with leading zeros are accepted ("239.192.087.029"); ambiguous (octal in inet_aton) and never equal to the canonical form
-	it.fails('rejects octets with leading zeros', () => {
+	it('rejects octets with leading zeros', () => {
 		expect(isIpv4Multicast('239.192.087.029')).toBe(false)
 		expect(isIpv4('01.2.3.4')).toBe(false)
 	})
@@ -265,8 +264,7 @@ describe('parseKnownSources', () => {
 		expect(parseKnownSources('239.255.1.1=Other')).toEqual([{ channel: undefined, ip: '239.255.1.1', label: 'Other' }])
 	})
 
-	// BUG: non-multicast IPs (a unicast address) are accepted as "known sources"
-	it.fails('rejects unicast addresses', () => {
+	it('rejects unicast addresses', () => {
 		expect(parseKnownSources('192.0.2.5=Unicast')).toEqual([])
 	})
 })

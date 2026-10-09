@@ -22,7 +22,7 @@ export function channelToMulticast(n: number, kind: ChannelKind = 'from'): strin
 }
 
 function octets(ip: string): number[] | null {
-	const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip)
+	const m = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(ip)
 	if (!m) return null
 	const o = m.slice(1).map(Number)
 	return o.every((v) => v <= 255) ? o : null
@@ -112,7 +112,7 @@ export function parseKnownSources(text: string): KnownSource[] {
 		const key = (eq === -1 ? t : t.slice(0, eq)).trim()
 		const label = eq === -1 ? '' : t.slice(eq + 1).trim()
 		const p = parseDstAddr(key)
-		if (!p.ip || key.includes(' ')) continue
+		if (!p.ip || key.includes(' ') || !isIpv4Multicast(p.ip)) continue
 		out.push({ channel: p.channel, ip: p.ip, label: label || key })
 	}
 	return out

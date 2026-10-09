@@ -352,8 +352,7 @@ describe('MIX', () => {
 		expect(apply(s, 'MIX 1:0')).toBeNull()
 	})
 
-	// BUG: an empty crosspoint value ("MIX 9 3:") is read as Number('') = 0, i.e. an active 0 dB crosspoint
-	it.fails('does not turn an empty crosspoint value into 0 dB', () => {
+	it('does not turn an empty crosspoint value into 0 dB', () => {
 		const s = fresh()
 		apply(s, 'MIX 9 3:')
 		expect(s.getXpoint(9, 3)).toBeUndefined()

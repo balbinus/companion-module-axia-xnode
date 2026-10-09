@@ -89,15 +89,13 @@ describe('clampGain', () => {
 		expect(Number.isInteger(clampGain(239.7))).toBe(true)
 	})
 
-	// BUG: clampGain(-0.2) returns -0 (harmless on the wire, but dbToTenths avoids it and the two are inconsistent)
-	it.fails('never returns negative zero', () => {
+	it('never returns negative zero', () => {
 		expect(Object.is(clampGain(-0.2), 0)).toBe(true)
 		expect(Object.is(clampGain(-0), 0)).toBe(true)
 	})
 
-	// BUG: NaN passes through clampGain unchanged, so callers must check for NaN themselves
-	it.fails('does not return NaN for NaN', () => {
-		expect(Number.isNaN(clampGain(Number.NaN))).toBe(false)
+	it('does not return NaN for NaN', () => {
+		expect(clampGain(Number.NaN)).toBe(0)
 	})
 })
 
@@ -137,8 +135,7 @@ describe('formatDb', () => {
 		expect(formatDb(-0.4)).toBe('0.0')
 	})
 
-	// BUG: NaN is formatted as "+NaN.NaN" instead of a neutral placeholder
-	it.fails('does not print NaN fragments for NaN', () => {
-		expect(formatDb(Number.NaN)).not.toMatch(/NaN/)
+	it('does not print NaN fragments for NaN', () => {
+		expect(formatDb(Number.NaN)).toBe('-')
 	})
 })

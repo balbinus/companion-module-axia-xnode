@@ -31,7 +31,8 @@ export function parseLine(line: string): LwrpLine | null {
 			continue
 		}
 		KEY_RE.lastIndex = pos
-		const key = KEY_RE.exec(raw)
+		// ERROR lines carry free text after the code: never read "word:" in it as an attribute
+		const key = tokens[0] === 'ERROR' ? null : KEY_RE.exec(raw)
 		if (key) {
 			pos = KEY_RE.lastIndex
 			if (tokens.length === 0 && Object.keys(attrs).length === 0) firstIsAttr = true
@@ -75,14 +76,14 @@ function safeToken(token: CommandArg, what: string): string {
 
 /**
  * Build a command line (without CRLF). Verb, args and attribute keys must be plain tokens (throws otherwise).
- * Number attribute values are sent bare and must be integers; string values are always quoted.
+ * Number attribute values are sent bare and must be safe integers; string values are always quoted.
  */
 export function formatCommand(verb: string, args: CommandArg[] = [], attrs: CommandAttrs = {}): string {
 	const parts = [safeToken(verb, 'verb'), ...args.map((a) => safeToken(a, 'argument'))]
 	for (const [key, value] of Object.entries(attrs)) {
 		if (!/^[A-Za-z0-9_.]+$/.test(key)) throw new RangeError(`Invalid attribute key: ${JSON.stringify(key)}`)
 		if (typeof value === 'number') {
-			if (!Number.isInteger(value)) throw new RangeError(`Attribute ${key} must be an integer, got ${value}`)
+			if (!Number.isSafeInteger(value)) throw new RangeError(`Attribute ${key} must be an integer, got ${value}`)
 			parts.push(`${key}:${value}`)
 		} else {
 			parts.push(`${key}:${quote(value)}`)
@@ -93,10 +94,12 @@ export function formatCommand(verb: string, args: CommandArg[] = [], attrs: Comm
 
 /** `MIX <out> <in>:<tenths> ...`; a null gain clears the crosspoint (`<in>:-`). */
 export function mixCommand(output: number, entries: Array<[input: number, tenths: number | null]>): string {
-	const parts = ['MIX', safeToken(output, 'mixer output')]
+	if (!Number.isSafeInteger(output) || output < 1) throw new RangeError(`Invalid mixer output: ${output}`)
+	const parts = ['MIX', String(output)]
 	for (const [input, tenths] of entries) {
-		if (!Number.isInteger(input) || input < 1) throw new RangeError(`Invalid mixer input: ${input}`)
-		if (tenths !== null && !Number.isInteger(tenths)) throw new RangeError(`Gain must be integer tenths, got ${tenths}`)
+		if (!Number.isSafeInteger(input) || input < 1) throw new RangeError(`Invalid mixer input: ${input}`)
+		if (tenths !== null && !Number.isSafeInteger(tenths))
+			throw new RangeError(`Gain must be integer tenths, got ${tenths}`)
 		parts.push(`${input}:${tenths ?? '-'}`)
 	}
 	return parts.join(' ')
