@@ -44,7 +44,10 @@ async function meterServer(): Promise<MeterServer> {
 	return state
 }
 
-function stream(srv: MeterServer, extra: { password?: string; intervalMs?: number; backoffMs?: number[] } = {}) {
+function stream(
+	srv: MeterServer,
+	extra: { password?: string; intervalMs?: number; backoffMs?: number[]; stallMs?: number } = {},
+) {
 	const lines: LwrpLine[] = []
 	const logs: string[] = []
 	const s = new HttpMeterStream({
@@ -53,6 +56,7 @@ function stream(srv: MeterServer, extra: { password?: string; intervalMs?: numbe
 		password: extra.password ?? '',
 		intervalMs: extra.intervalMs ?? 500,
 		backoffMs: extra.backoffMs ?? [20, 40],
+		stallMs: extra.stallMs,
 		onLine: (l) => lines.push(l),
 		log: (level, m) => logs.push(`${level}: ${m}`),
 	})
@@ -128,15 +132,25 @@ describe('HttpMeterStream', () => {
 		await waitFor(() => srv.responses.length === 2)
 	})
 
-	// BUG: after a non-200 answer the stream gives up for good (no reconnect is scheduled), so a wrong/transient 401/503 kills HWI/HWO meters
-	it.fails('non-200 answers (wrong password) are logged and retried', async () => {
+	it('non-200 answers (wrong password) are logged and retried', async () => {
 		const srv = await meterServer()
 		srv.failWith.push(401, 401)
 		const { s, logs } = stream(srv, { backoffMs: [20] })
 		s.start()
 		await waitFor(() => srv.responses.length === 1, { message: 'third request streams', timeoutMs: 600 })
 		expect(srv.requests).toHaveLength(3)
+		// logged once as a warning, the identical retries stay at debug level
+		expect(logs.filter((l) => l.startsWith('warn') && l.includes('status 401'))).toHaveLength(1)
 		expect(logs.filter((l) => l.includes('status 401'))).toHaveLength(2)
+	})
+
+	it('a stream that goes silent is dropped and reconnected', async () => {
+		const srv = await meterServer()
+		const { s, logs } = stream(srv, { stallMs: 80 })
+		s.start()
+		await waitFor(() => srv.responses.length === 1)
+		await waitFor(() => srv.responses.length === 2, { message: 'reconnect after the stall' })
+		expect(logs.some((l) => l.startsWith('warn') && l.includes('no data'))).toBe(true)
 	})
 
 	it('connection refused is retried until the server comes back', async () => {

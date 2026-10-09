@@ -16,6 +16,8 @@ export interface HttpMeterOptions {
 	log?: (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void
 	/** Reconnect delays, last repeats */
 	backoffMs?: number[]
+	/** No data for this long -> reconnect (default: 3x the interval, at least 5 s) */
+	stallMs?: number
 }
 
 const DEFAULT_BACKOFF = [1000, 2000, 5000, 10_000, 30_000]
@@ -25,6 +27,8 @@ export class HttpMeterStream {
 	private timer: NodeJS.Timeout | undefined
 	private stopped = true
 	private attempt = 0
+	private stallTimer: NodeJS.Timeout | undefined
+	private lastBadStatus: number | undefined
 
 	constructor(private readonly options: HttpMeterOptions) {}
 
@@ -37,7 +41,8 @@ export class HttpMeterStream {
 	stop(): void {
 		this.stopped = true
 		clearTimeout(this.timer)
-		this.timer = undefined
+		clearTimeout(this.stallTimer)
+		this.timer = this.stallTimer = undefined
 		const req = this.req
 		this.req = null
 		req?.destroy()
@@ -48,6 +53,14 @@ export class HttpMeterStream {
 		const { host, port = 80, password, intervalMs, onLine, log } = this.options
 		const interval = Math.max(100, Math.round(intervalMs))
 		let buffer = ''
+		const stallMs = this.options.stallMs ?? Math.max(5000, 3 * interval)
+		const arm = (): void => {
+			clearTimeout(this.stallTimer)
+			this.stallTimer = setTimeout(() => {
+				log?.('warn', `HTTP meter stream: no data for ${stallMs} ms, reconnecting`)
+				this.scheduleReconnect(req)
+			}, stallMs)
+		}
 		const req = http.get(
 			{
 				host,
@@ -58,13 +71,19 @@ export class HttpMeterStream {
 			},
 			(res) => {
 				if (res.statusCode !== 200) {
-					log?.('warn', `HTTP meter stream: status ${res.statusCode}`)
+					// log once per distinct status, the retries stay quiet until a 200
+					const status = res.statusCode ?? 0
+					log?.(status === this.lastBadStatus ? 'debug' : 'warn', `HTTP meter stream: status ${status}`)
+					this.lastBadStatus = status
 					res.destroy()
+					this.scheduleReconnect(req)
 					return
 				}
 				this.attempt = 0
+				this.lastBadStatus = undefined
 				res.setEncoding('latin1')
 				res.on('data', (chunk: string) => {
+					arm()
 					buffer += chunk
 					let nl: number
 					while ((nl = buffer.indexOf('\n')) !== -1) {
@@ -78,6 +97,7 @@ export class HttpMeterStream {
 			},
 		)
 		this.req = req
+		arm()
 		req.on('error', (err) => {
 			log?.('debug', `HTTP meter stream error: ${err.message}`)
 			this.scheduleReconnect(req)
@@ -87,6 +107,7 @@ export class HttpMeterStream {
 	private scheduleReconnect(req: http.ClientRequest): void {
 		if (this.stopped || this.req !== req) return
 		this.req = null
+		clearTimeout(this.stallTimer)
 		req.destroy()
 		const backoff = this.options.backoffMs ?? DEFAULT_BACKOFF
 		const delay = backoff[Math.min(this.attempt, backoff.length - 1)]

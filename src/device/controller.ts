@@ -2,7 +2,13 @@ import { EventEmitter } from 'node:events'
 import { anyWriteEnabled, isValidHost, isValidPort, type ModuleConfig } from '../config.js'
 import type { LwrpLine } from '../lwrp/parser.js'
 import { XNodeState, type MeterKind, type StateChange } from '../model/state.js'
-import { LwrpConnection, LwrpConnectionError, LwrpError, LwrpTimeoutError } from './connection.js'
+import {
+	LwrpConnection,
+	LwrpConnectionError,
+	LwrpError,
+	LwrpInvalidCommandError,
+	LwrpTimeoutError,
+} from './connection.js'
 import { HttpMeterStream } from './meters-http.js'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -37,6 +43,10 @@ export interface ControllerTimings {
 	resyncMs: number
 	levelsReadyMs: number
 	lvlPaceMs: number
+	/** Max time the queue is held after the LVL subscriptions waiting for their first answers */
+	lvlHoldMs: number
+	/** Time the queue is held after LOGIN (it is not answered; an ERROR in that window means a wrong password) */
+	loginSettleMs: number
 	/** Reconnect delays; the last one repeats */
 	backoffMs: number[]
 	connectTimeoutMs: number
@@ -50,6 +60,8 @@ export const DEFAULT_TIMINGS: ControllerTimings = {
 	resyncMs: 60_000,
 	levelsReadyMs: 3000,
 	lvlPaceMs: 20,
+	lvlHoldMs: 1500,
+	loginSettleMs: 100,
 	backoffMs: [1000, 2000, 5000, 10_000, 30_000],
 	connectTimeoutMs: 5000,
 	listQuietMs: 250,
@@ -75,6 +87,12 @@ interface LevelChannel {
 }
 
 const SYNC_MAX_REQUERIES = 2
+/** Consecutive unanswered sync queries after which the link is considered dead */
+const SYNC_MAX_TIMEOUTS = 2
+/** Unanswered queries in one sync (even if not consecutive) after which the link is considered dead */
+const SYNC_MAX_TOTAL_TIMEOUTS = 5
+/** Consecutive unanswered heartbeats before the session is dropped */
+const HEARTBEAT_MAX_MISSES = 2
 
 function errMsg(e: unknown): string {
 	return e instanceof Error ? e.message : String(e)
@@ -96,6 +114,9 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private attempt = 0
 	private syncing = false
 	private partial = false
+	private syncTimeouts = 0
+	private syncTotalTimeouts = 0
+	private heartbeatMisses = 0
 	private levelsReadyFlag = false
 	private levelChannels: LevelChannel[] = []
 	private reconnectTimer: NodeJS.Timeout | undefined
@@ -104,7 +125,6 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private levelsTimer: NodeJS.Timeout | undefined
 	private meterTimer: NodeJS.Timeout | undefined
 	private httpMeters: HttpMeterStream | undefined
-	private readonly sleepers = new Set<{ timer: NodeJS.Timeout; resolve: () => void }>()
 
 	constructor(
 		private readonly config: ControllerConfig,
@@ -134,6 +154,12 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		return this.levelsReadyFlag
 	}
 
+	/** Password without anything that cannot be sent on one line (the config value may be missing) */
+	private get password(): string {
+		const p: unknown = this.config.password
+		return typeof p === 'string' ? p.replace(/[^\x20-\x7e\xa0-\xff]/g, '') : ''
+	}
+
 	/** Start connecting. Sets status BadConfig (and does not connect) when host or port are invalid. */
 	start(): void {
 		if (this.started || this.destroyed) return
@@ -151,11 +177,6 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		this.destroyed = true
 		this.teardownSession()
 		clearTimeout(this.reconnectTimer)
-		for (const s of this.sleepers) {
-			clearTimeout(s.timer)
-			s.resolve()
-		}
-		this.sleepers.clear()
 		this.removeAllListeners()
 	}
 
@@ -204,6 +225,7 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 			connectTimeoutMs: this.timings.connectTimeoutMs,
 			onLine: (line) => this.onLine(id, line),
 			onClose: (err) => this.onSocketClosed(id, err),
+			onWarn: (message) => this.log('warn', message),
 		})
 		const session: Session = { id, conn, synced: false }
 		this.session = session
@@ -216,7 +238,15 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		if (this.session !== session || this.destroyed) return
 		this.log('info', `connected to ${this.config.host}:${this.config.port}`)
 		try {
-			if (anyWriteEnabled(this.config)) conn.send(`LOGIN ${this.config.password.replace(/[\r\n]/g, '')}`)
+			if (anyWriteEnabled(this.config)) {
+				const { errors } = await conn.burst([`LOGIN ${this.password}`], {
+					holdMs: this.timings.loginSettleMs,
+				})
+				if (this.session !== session) return
+				if (errors.length > 0)
+					this.log('warn', `login failed (${errors[0].message}); writes will be refused by the node`)
+			}
+			this.heartbeatMisses = 0
 			this.heartbeatTimer = setInterval(() => void this.heartbeat(session), this.timings.heartbeatMs)
 			const complete = await this.sync(session, true)
 			if (this.session !== session) return
@@ -268,8 +298,16 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		if (this.session !== session) return
 		try {
 			await session.conn.query('VER', { timeoutMs: this.timings.queryTimeoutMs })
+			this.heartbeatMisses = 0
 		} catch (e) {
-			if (e instanceof LwrpError) return // answered, so alive
+			if (e instanceof LwrpError) {
+				this.heartbeatMisses = 0
+				return // answered, so alive
+			}
+			if (e instanceof LwrpTimeoutError && ++this.heartbeatMisses < HEARTBEAT_MAX_MISSES) {
+				this.log('debug', 'heartbeat missed once')
+				return
+			}
 			this.dropSession(session, `heartbeat failed: ${errMsg(e)}`)
 		}
 	}
@@ -328,12 +366,20 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 		conn: LwrpConnection,
 		cmd: string,
 		opts: Parameters<LwrpConnection['query']>[1] = {},
+		maxTimeouts = SYNC_MAX_TIMEOUTS,
 	): Promise<LwrpLine[] | null> {
 		try {
-			return await conn.query(cmd, { timeoutMs: this.timings.queryTimeoutMs, ...opts })
+			const lines = await conn.query(cmd, { timeoutMs: this.timings.queryTimeoutMs, ...opts })
+			this.syncTimeouts = 0
+			return lines
 		} catch (e) {
-			if (e instanceof LwrpError || e instanceof LwrpTimeoutError) {
+			if (e instanceof LwrpError || e instanceof LwrpTimeoutError || e instanceof LwrpInvalidCommandError) {
 				this.log('debug', `query "${cmd}" failed: ${errMsg(e)}`)
+				if (e instanceof LwrpTimeoutError) {
+					this.syncTotalTimeouts++
+					if (++this.syncTimeouts >= maxTimeouts || this.syncTotalTimeouts >= SYNC_MAX_TOTAL_TIMEOUTS)
+						throw new LwrpConnectionError(`no answer to ${this.syncTimeouts} consecutive queries`)
+				} else this.syncTimeouts = 0
 				return null
 			}
 			throw e
@@ -344,6 +390,8 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private async sync(session: Session, initial: boolean): Promise<boolean> {
 		const conn = session.conn
 		this.syncing = true
+		this.syncTimeouts = 0
+		this.syncTotalTimeouts = 0
 		try {
 			const ver = await conn.query('VER', { timeoutMs: this.timings.queryTimeoutMs })
 			if (this.session !== session) return false
@@ -393,7 +441,7 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 					let ok = false
 					for (let attempt = 0; attempt < SYNC_MAX_REQUERIES && !ok; attempt++) {
 						this.log('debug', `sync: missing ${verb} ${n}, re-querying`)
-						ok = ((await this.tryQuery(conn, `${verb} ${n}`)) ?? []).length > 0
+						ok = ((await this.tryQuery(conn, `${verb} ${n}`, {}, SYNC_MAX_TIMEOUTS + 1)) ?? []).length > 0
 					}
 					if (!ok) {
 						complete = false
@@ -429,13 +477,20 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 	private async subscribeLevels(session: Session): Promise<void> {
 		if (!this.config.levelAlerts) return
 		this.levelChannels = this.computeLevelChannels()
-		// Paced: xNode2 occasionally drops lines of bursts. Never sends threshold parameters.
-		for (const ch of this.levelChannels) {
-			if (this.session !== session || !session.conn.isOpen) return
-			session.conn.send(`LVL ${ch.group} ${ch.n}`)
-			await this.sleep(this.timings.lvlPaceMs)
-		}
+		if (this.levelChannels.length === 0) return
+		// One queued item: paced (xNode2 occasionally drops lines of bursts), holds the queue until the first
+		// answers arrived so that an ERROR is never attributed to a write. Never sends threshold parameters.
+		const { errors } = await session.conn.burst(
+			this.levelChannels.map((ch) => `LVL ${ch.group} ${ch.n}`),
+			{
+				paceMs: this.timings.lvlPaceMs,
+				holdMs: this.timings.lvlHoldMs,
+				answerKey: (l) => (l.verb === 'LVL' ? `${l.args[0]} ${(l.args[1] ?? '').split('.')[0]}` : undefined),
+				expectKeys: this.levelChannels.length,
+			},
+		)
 		if (this.session !== session) return
+		for (const e of errors) this.log('warn', `level subscription: ${e.message}`)
 		this.levelsTimer = setTimeout(() => this.setLevelsReady(true), this.timings.levelsReadyMs)
 	}
 
@@ -450,7 +505,10 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 
 	private startMeters(session: Session): void {
 		const mode = this.config.meterMode
-		const interval = Math.max(100, this.config.meterInterval || 500)
+		const interval = Math.max(
+			100,
+			typeof this.config.meterInterval === 'number' ? this.config.meterInterval || 500 : 500,
+		)
 		if (mode === 'poll') {
 			this.meterTimer = setInterval(() => {
 				// low priority: never queue behind other work
@@ -461,7 +519,7 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 			this.httpMeters = new HttpMeterStream({
 				host: this.config.host.trim(),
 				port: this.timings.httpMeterPort,
-				password: this.config.password,
+				password: this.password,
 				intervalMs: interval,
 				onLine: (line) => {
 					const change = this.state.applyLine(line)
@@ -471,19 +529,6 @@ export class XNodeController extends EventEmitter<ControllerEvents> {
 			})
 			this.httpMeters.start()
 		}
-	}
-
-	private async sleep(ms: number): Promise<void> {
-		return new Promise((resolve) => {
-			const entry = {
-				timer: setTimeout(() => {
-					this.sleepers.delete(entry)
-					resolve()
-				}, ms),
-				resolve,
-			}
-			this.sleepers.add(entry)
-		})
 	}
 
 	/** True while a sync is running or the last sync was partial (for diagnostics) */

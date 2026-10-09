@@ -323,8 +323,7 @@ describe('level alerts', () => {
 		expect(mock.violations()).toEqual([])
 	})
 
-	// BUG: LVL subscriptions are sent outside the queue, so an ERROR answering one of them while a write is in flight rejects that write
-	it.fails('an ERROR answering an LVL subscription is not attributed to a write that is in flight', async () => {
+	it('an ERROR answering an LVL subscription is not attributed to a write that is in flight', async () => {
 		const mock = await startMock({ dialect: 'xnode2' })
 		mock.noEcho = true
 		mock.injectError(/^LVL ICH 3$/, 'ERROR 1000 bad command', 1)
@@ -509,9 +508,8 @@ describe('heartbeat, reconnect, resync', () => {
 		expect(ctrl.state.nsrc).toBe(4)
 	})
 
-	// BUG: a link that dies during the sync is only noticed after every remaining query has timed out one after the other (the heartbeat is queued behind the sync)
-	it.fails('a link that dies in the middle of the initial sync is dropped after about one query timeout', async () => {
-		const mock = await startMock({ dialect: 'xnode2' })
+	it('a link that dies in the middle of the initial sync is dropped after about one query timeout', async () => {
+		const mock = await startMock({ dialect: 'xnode2', answerDelayMs: 40 })
 		const rig = makeCtrl(mock, {}, { queryTimeoutMs: 150 })
 		rig.ctrl.start()
 		await waitFor(() => mock.lines('SRC').length >= 1)
@@ -519,6 +517,39 @@ describe('heartbeat, reconnect, resync', () => {
 		const t0 = Date.now()
 		await waitFor(() => rig.statuses.some((s) => s.status === 'connection_failure'), { timeoutMs: 1000 })
 		expect(Date.now() - t0).toBeLessThan(150 * 3)
+	})
+
+	it('a node that answers VER and then goes silent aborts the sync after two unanswered queries', async () => {
+		const mock = await startMock({ dialect: 'xnode2', answerDelayMs: 40 })
+		const rig = makeCtrl(mock, {}, { queryTimeoutMs: 100 })
+		rig.ctrl.start()
+		await waitFor(() => mock.lines('VER').length >= 1)
+		await sleep(60) // VER answered
+		mock.mute = true
+		const t0 = Date.now()
+		await waitFor(() => rig.statuses.some((s) => s.status === 'connection_failure'), { timeoutMs: 1000 })
+		expect(Date.now() - t0).toBeLessThan(100 * 3 + 100)
+		expect(rig.synced).toEqual([])
+	})
+
+	it('one missed heartbeat is tolerated, two consecutive ones drop the session', async () => {
+		const { mock, ctrl, statuses } = await started('xnode2', {}, { heartbeatMs: 100, queryTimeoutMs: 60 })
+		mock.mute = true
+		await waitFor(() => mock.commands.filter((c) => c.muted && c.verb === 'VER').length >= 1)
+		expect(ctrl.status).toBe('ok')
+		mock.mute = false // the second heartbeat is answered: the miss counter resets
+		await sleep(250)
+		expect(statuses.some((s) => s.status === 'connection_failure')).toBe(false)
+		mock.mute = true
+		await waitFor(() => statuses.some((s) => s.status === 'connection_failure'), { timeoutMs: 1500 })
+	})
+
+	it('a missing password (undefined config value) does not break the connection', async () => {
+		const mock = await startMock({ dialect: 'xnode2' })
+		const rig = makeCtrl(mock, { allowMixerWrites: true, password: undefined as unknown as string })
+		rig.ctrl.start()
+		await waitFor(() => rig.synced.length === 1)
+		expect(mock.lines('LOGIN')).toEqual(['LOGIN'])
 	})
 
 	it('startup against a closed port ends in connection_failure and keeps retrying', async () => {

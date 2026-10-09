@@ -1,6 +1,12 @@
 import net from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
-import { LwrpConnection, LwrpConnectionError, LwrpError, LwrpTimeoutError } from '../../src/device/connection.js'
+import {
+	LwrpConnection,
+	LwrpConnectionError,
+	LwrpError,
+	LwrpInvalidCommandError,
+	LwrpTimeoutError,
+} from '../../src/device/connection.js'
 import type { LwrpLine } from '../../src/lwrp/parser.js'
 import { MockXNode, type Dialect, type MockOptions } from '../helpers/mock-xnode.js'
 import { sleep, waitFor } from '../helpers/wait-for.js'
@@ -247,20 +253,92 @@ describe('answer completion', () => {
 		expect(h.lines).toHaveLength(3)
 	})
 
-	// BUG: a push of the same verb arriving before BEGIN completes the list query early and the leftover BEGIN/END desynchronises the next query
-	it.fails('a same-verb push arriving before the BEGIN of a list does not corrupt this or the next query', async () => {
+	it('a same-verb push arriving before the BEGIN of a list does not corrupt this or the next query', async () => {
 		const [raw, h] = await withRaw()
 		const q1 = h.conn.query('SRC')
 		const q2 = h.conn.query('DST')
 		await waitFor(() => raw.received.length === 1)
 		raw.write('SRC 5 PSNM:pushed\r\n')
-		await waitFor(() => raw.received.length === 2) // the next query has started
+		await sleep(20)
+		expect(raw.received).toHaveLength(1) // the list query is still in flight
 		raw.write('BEGIN\r\nSRC 1 PSNM:a\r\nSRC 2 PSNM:b\r\nEND\r\n')
 		await sleep(20)
 		raw.write('BEGIN\r\nDST 1 NAME:a\r\nDST 2 NAME:b\r\nEND\r\n')
+		await waitFor(() => raw.received.length === 2)
+		raw.write('BEGIN\r\nDST 1 NAME:a\r\nDST 2 NAME:b\r\nEND\r\n')
 		const [a, b] = await Promise.all([q1, q2])
-		expect(a.length).toBeGreaterThanOrEqual(2)
+		expect(a.map((l) => l.raw)).toEqual(['SRC 1 PSNM:a', 'SRC 2 PSNM:b'])
 		expect(b).toHaveLength(2)
+		expect(h.lines.map((l) => l.raw)).toContain('SRC 5 PSNM:pushed')
+	})
+
+	it.each([
+		['U+010D (low byte CR)', 'SRC 1 PSNM:"a\u010dLOGOUT"'],
+		['U+020A (low byte LF)', 'SRC 1 PSNM:"a\u020aLOGOUT"'],
+		['U+0122 (low byte quote)', 'SRC 1 PSNM:"a\u0122 x"'],
+		['raw CR', 'SRC 1 PSNM:"a\rLOGOUT"'],
+		['raw LF', 'SRC 1 PSNM:"a\nLOGOUT"'],
+		['NUL', 'SRC 1 PSNM:"a\u0000"'],
+	])('send refuses a command with %s and writes nothing', async (_n, cmd) => {
+		const [raw, h] = await withRaw()
+		expect(() => h.conn.send(cmd)).toThrow(LwrpInvalidCommandError)
+		await expect(h.conn.write(cmd)).rejects.toBeInstanceOf(LwrpInvalidCommandError)
+		await expect(h.conn.query(cmd)).rejects.toBeInstanceOf(LwrpInvalidCommandError)
+		await sleep(30)
+		expect(raw.received).toEqual([])
+		expect(h.conn.pending).toBe(0)
+	})
+
+	it('send still accepts Latin-1 names (accents)', async () => {
+		const [raw, h] = await withRaw()
+		h.conn.send('SRC 1 PSNM:"Caf\u00e9 \u00ff"')
+		await waitFor(() => raw.received.length === 1)
+	})
+
+	it('a stray BEGIN/END does not turn a single-object query into a list', async () => {
+		const [raw, h] = await withRaw()
+		const q = h.conn.query('VER')
+		await waitFor(() => raw.received.length === 1)
+		raw.write('BEGIN\r\nEND\r\nVER LWRP:1.4\r\n')
+		await expect(q).resolves.toHaveLength(1)
+	})
+
+	it('an unwrapped list (legacy MIX) with expectCount ignores a same-verb push only when BEGIN follows', async () => {
+		const [raw, h] = await withRaw()
+		const q = h.conn.query('MIX', { expectCount: 2 })
+		await waitFor(() => raw.received.length === 1)
+		raw.write('MIX 1 2:-10\r\nMIX 2 \r\n')
+		await expect(q).resolves.toHaveLength(2)
+	})
+
+	it('a line buffer that grows without a newline is capped and the next line parses', async () => {
+		const [raw, h] = await withRaw()
+		raw.write('X'.repeat(70_000))
+		await sleep(30)
+		raw.write('tail of the garbage\r\n')
+		const q = h.conn.query('VER')
+		await waitFor(() => raw.received.length === 1)
+		raw.write('VER LWRP:1.2\r\n')
+		await expect(q).resolves.toHaveLength(1)
+		expect(h.lines.map((l) => l.verb)).toEqual(['VER'])
+	})
+
+	it('burst holds the queue until the answers arrived and returns ERRORs instead of rejecting', async () => {
+		const [raw, h] = await withRaw()
+		const b = h.conn.burst(['LVL ICH 1', 'LVL ICH 2'], {
+			holdMs: 1000,
+			answerKey: (l) => (l.verb === 'LVL' ? l.args[1] : undefined),
+			expectKeys: 2,
+		})
+		const q = h.conn.query('VER')
+		await waitFor(() => raw.received.length === 2)
+		raw.write('ERROR 1000 bad command\r\nLVL ICH 1.L LOW\r\n')
+		const res = await b
+		expect(res.errors).toHaveLength(1)
+		expect(res.answered).toBe(2)
+		await waitFor(() => raw.received.length === 3)
+		raw.write('VER LWRP:1.2\r\n')
+		await expect(q).resolves.toHaveLength(1)
 	})
 
 	it('a list answer that is empty (BEGIN, END) yields no lines', async () => {
@@ -411,8 +489,7 @@ describe('close and failure paths', () => {
 		await expect(h.conn.write('DST 1 OUGN:0')).rejects.toBeInstanceOf(LwrpConnectionError)
 	})
 
-	// BUG: requests still queued when the socket closes are rejected but never leave `pending` (queued-- is skipped), so pending stays > 0
-	it.fails('after the socket closes, queued requests are rejected and pending returns to 0', async () => {
+	it('after the socket closes, queued requests are rejected and pending returns to 0', async () => {
 		const [raw, h] = await withRaw()
 		const qs = [h.conn.query('VER'), h.conn.query('SRC'), h.conn.query('DST')].map(async (p) =>
 			p.catch((e: unknown) => e),

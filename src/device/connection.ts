@@ -18,13 +18,14 @@ import { parseLine, type LwrpLine } from '../lwrp/parser.js'
  *  CFG GPO        ERROR 1000                               BEGIN, lines, END
  *  GPO n          ERROR 1000                               one line; invalid port -> ERROR 1006
  *  MTR            BEGIN, ICH+OCH lines, END                BEGIN, HWI+HWO+ICH+OCH lines, END
- *  LVL x n        no immediate answer, lines after ~300 ms (not handled by the queue: `send`)
- *  LOGIN          no answer at all (`send`)
+ *  LVL x n        no immediate answer, lines after ~300 ms (queued as a `burst`)
+ *  LOGIN          no answer at all (queued as a `burst`, an ERROR means a wrong password)
  *
  * Completion rules used by `query`:
- *  - a BEGIN before any matching line: collect matching lines until END
- *  - otherwise the first matching line completes a single-object query; `expectCount` (distinct
- *    indices) and `quietMs` handle unwrapped multi-line answers (legacy MIX, IP)
+ *  - a list command (bare `SRC`, `DST`, `MIX`, `INP`, `GPI`, `GPO`, `MTR`, `CFG GPO`, `ADD GPI|GPO`) completes on
+ *    the END that follows its own BEGIN. Matching lines before the BEGIN are pushes (only emitted to `onLine`).
+ *    Unwrapped lists (legacy MIX, IP) must pass `expectCount` (distinct indices) or `quietMs`.
+ *  - any other command: the first matching line completes it; BEGIN/END are ignored
  *  - ERROR while a command is in flight rejects it (errors cannot be attributed, hence one in flight)
  * Answers are matched by verb (+ index), never by position, so pushes can interleave freely.
  */
@@ -49,6 +50,16 @@ export class LwrpTimeoutError extends Error {
 		this.name = 'LwrpTimeoutError'
 	}
 }
+
+/** The command contains characters that cannot be sent safely (never written to the socket) */
+export class LwrpInvalidCommandError extends Error {
+	constructor(readonly command: string) {
+		super('Refusing to send a command with characters outside printable Latin-1')
+		this.name = 'LwrpInvalidCommandError'
+	}
+}
+
+const SAFE_COMMAND = /^[\x20-\x7e\xa0-\xff]*$/
 
 export class LwrpConnectionError extends Error {
 	constructor(message: string) {
@@ -85,9 +96,35 @@ export interface LwrpConnectionOptions {
 	onLine: (line: LwrpLine) => void
 	/** Called once when the socket closes or errors after `connect()` succeeded */
 	onClose: (error?: Error) => void
+	/** Diagnostics (e.g. line buffer overflow) */
+	onWarn?: (message: string) => void
 }
 
+/** A line without terminator longer than this is garbage: it is dropped (up to the next newline) */
+export const MAX_LINE_BUFFER = 64 * 1024
+
+export interface BurstOptions {
+	/** Delay between two commands (xNode2 occasionally drops lines of a tight burst) */
+	paceMs?: number
+	/** Release the queue after this long at the latest (also the plain settle time when no answer is expected) */
+	holdMs: number
+	/** Release early once `expectKeys` distinct keys were returned by `answerKey` (ERRORs count as answers) */
+	answerKey?: (line: LwrpLine) => string | undefined
+	expectKeys?: number
+}
+
+export interface BurstResult {
+	/** ERRORs received while the burst held the queue (they cannot be attributed more precisely) */
+	errors: LwrpError[]
+	/** Distinct answer keys seen */
+	answered: number
+}
+
+const LIST_VERBS = new Set(['SRC', 'DST', 'MIX', 'INP', 'GPI', 'GPO', 'MTR'])
+
 interface Matcher {
+	/** Bare list command: the answer is wrapped in BEGIN/END (unless unwrapped via expectCount/quietMs) */
+	list: boolean
 	verb: string
 	/** Extra leading positional args (`CFG GPO`) */
 	prefix: string[]
@@ -108,7 +145,8 @@ function buildMatcher(cmd: string, opts: { verb?: string; index?: string | numbe
 	}
 	const first = rest[0]
 	const index = opts.index !== undefined ? String(opts.index) : first && /^\d+$/.test(first) ? first : undefined
-	return { verb: (opts.verb ?? verb).toUpperCase(), prefix, index }
+	const list = rest.length === 0 && (LIST_VERBS.has(verb) || prefix[0] === 'GPO')
+	return { list, verb: (opts.verb ?? verb).toUpperCase(), prefix, index }
 }
 
 function matches(m: Matcher, line: LwrpLine, withIndex = true): boolean {
@@ -126,6 +164,7 @@ interface InFlight {
 export class LwrpConnection {
 	private socket: net.Socket | null = null
 	private buffer = ''
+	private discarding = false
 	private open = false
 	private inFlight: InFlight | null = null
 	private chain: Promise<unknown> = Promise.resolve()
@@ -187,15 +226,18 @@ export class LwrpConnection {
 		this.socket = null
 		this.open = false
 		this.buffer = ''
+		this.discarding = false
 		socket?.removeAllListeners('data')
 		socket?.on('error', () => undefined)
 		socket?.destroy()
 		this.failAll(new LwrpConnectionError('Connection closed'))
 	}
 
-	/** Fire and forget (LOGIN, LVL subscriptions). Throws if the socket is not open. */
+	/** Write a raw line outside the queue. Prefer `burst` for anything that may be answered. Throws if not open. */
 	send(cmd: string): void {
 		if (!this.open || !this.socket) throw new LwrpConnectionError('Not connected')
+		// Latin-1 encoding truncates code points > 0xFF to their low byte (U+010D -> CR): never let them through
+		if (!SAFE_COMMAND.test(cmd)) throw new LwrpInvalidCommandError(cmd)
 		this.socket.write(`${cmd}\r\n`, 'latin1')
 	}
 
@@ -211,6 +253,7 @@ export class LwrpConnection {
 					const seen = new Set<string>()
 					let begun = false
 					let quiet: NodeJS.Timeout | undefined
+					const unwrapped = opts.expectCount !== undefined || opts.quietMs !== undefined
 					const done = (err?: Error): void => {
 						clearTimeout(timer)
 						clearTimeout(quiet)
@@ -224,8 +267,12 @@ export class LwrpConnection {
 							done(new LwrpError(Number.parseInt(line.args[0] ?? '', 10) || 0, line.args.slice(1).join(' '), cmd))
 							return true
 						}
-						if (!begun && lines.length === 0 && line.verb === 'BEGIN') {
+						if (matcher.list && !begun && line.verb === 'BEGIN') {
+							// the answer starts here: whatever matched before was a push
 							begun = true
+							lines.length = 0
+							seen.clear()
+							clearTimeout(quiet)
 							return false
 						}
 						if (begun) {
@@ -237,6 +284,7 @@ export class LwrpConnection {
 							return false
 						}
 						if (!matches(matcher, line)) return false
+						if (matcher.list && !unwrapped) return false // a push, the BEGIN is still to come
 						lines.push(line)
 						seen.add(line.args[matcher.prefix.length] ?? '')
 						if (opts.expectCount !== undefined) {
@@ -291,6 +339,70 @@ export class LwrpConnection {
 		)
 	}
 
+	/**
+	 * Queue a group of commands that are not answered per command (LOGIN, LVL subscriptions). Sends them,
+	 * then holds the queue until the expected first answers arrived or `holdMs` elapsed, so an ERROR cannot be
+	 * attributed to a later command. ERRORs received meanwhile are returned, not thrown.
+	 */
+	async burst(cmds: string[], opts: BurstOptions): Promise<BurstResult> {
+		return this.enqueue(
+			cmds[0] ?? '',
+			async (inFlight) =>
+				new Promise<BurstResult>((resolve, reject) => {
+					const errors: LwrpError[] = []
+					const keys = new Set<string>()
+					const timers = new Set<NodeJS.Timeout>()
+					let finished = false
+					const finish = (err?: Error): void => {
+						if (finished) return
+						finished = true
+						for (const t of timers) clearTimeout(t)
+						if (err) reject(err)
+						else resolve({ errors, answered: keys.size })
+					}
+					const check = (): void => {
+						if (opts.expectKeys !== undefined && keys.size >= opts.expectKeys && sent) finish()
+					}
+					let sent = false
+					inFlight.fail = finish
+					inFlight.onLine = (line) => {
+						if (line.verb === 'ERROR') {
+							errors.push(new LwrpError(Number.parseInt(line.args[0] ?? '', 10) || 0, line.args.slice(1).join(' ')))
+							keys.add(`ERROR#${errors.length}`)
+						} else {
+							const key = opts.answerKey?.(line)
+							if (key !== undefined) keys.add(key)
+						}
+						check()
+						return finished
+					}
+					const sendFrom = (i: number): void => {
+						if (finished) return
+						try {
+							while (i < cmds.length) {
+								this.send(cmds[i++])
+								if (opts.paceMs && i < cmds.length) {
+									const t = setTimeout(() => {
+										timers.delete(t)
+										sendFrom(i)
+									}, opts.paceMs)
+									timers.add(t)
+									return
+								}
+							}
+						} catch (e) {
+							finish(e as Error)
+							return
+						}
+						sent = true
+						check()
+					}
+					timers.add(setTimeout(() => finish(), opts.holdMs + (opts.paceMs ?? 0) * cmds.length))
+					sendFrom(0)
+				}),
+		)
+	}
+
 	private write0(cmd: string, fail: (e: Error) => void): void {
 		try {
 			this.send(cmd)
@@ -303,13 +415,13 @@ export class LwrpConnection {
 		if (!this.open) return Promise.reject(new LwrpConnectionError('Not connected'))
 		this.queued++
 		const task = this.chain.then(async () => {
-			if (!this.open) throw new LwrpConnectionError('Not connected')
 			const inFlight: InFlight = {
 				onLine: () => false,
 				fail: () => undefined,
 			}
-			this.inFlight = inFlight
 			try {
+				if (!this.open) throw new LwrpConnectionError('Not connected')
+				this.inFlight = inFlight
 				return await run(inFlight)
 			} finally {
 				if (this.inFlight === inFlight) this.inFlight = null
@@ -326,6 +438,10 @@ export class LwrpConnection {
 		while ((nl = this.buffer.indexOf('\n')) !== -1) {
 			const raw = this.buffer.slice(0, nl)
 			this.buffer = this.buffer.slice(nl + 1)
+			if (this.discarding) {
+				this.discarding = false // the tail of an oversized line
+				continue
+			}
 			const line = parseLine(raw)
 			if (!line) continue
 			try {
@@ -335,6 +451,11 @@ export class LwrpConnection {
 			}
 			this.inFlight?.onLine(line)
 		}
+		if (this.buffer.length > MAX_LINE_BUFFER) {
+			this.options.onWarn?.(`dropping ${this.buffer.length} bytes received without a line terminator`)
+			this.buffer = ''
+			this.discarding = true
+		}
 	}
 
 	private handleClose(socket: net.Socket, error?: Error): void {
@@ -342,6 +463,7 @@ export class LwrpConnection {
 		this.socket = null
 		this.open = false
 		this.buffer = ''
+		this.discarding = false
 		socket.destroy()
 		this.failAll(error ?? new LwrpConnectionError('Connection closed'))
 		this.options.onClose(error)
