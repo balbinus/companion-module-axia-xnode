@@ -1,18 +1,18 @@
 {
 	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
 	"type": "connection",
-	"id": "your-module-name",
-	"name": "your-module-name",
-	"shortname": "module-shortname",
-	"description": "A short one line description of your module",
-	"version": "0.0.0",
+	"id": "axia-xnode",
+	"name": "Axia xNode",
+	"shortname": "Axia xNode",
+	"description": "Monitor and control Axia xNode / xNode2 audio nodes over LWRP: mixer, routing, gains, levels, GPIO",
+	"version": "0.1.0",
 	"license": "MIT",
-	"repository": "git+https://github.com/bitfocus/companion-module-your-module-name.git",
-	"bugs": "https://github.com/bitfocus/companion-module-your-module-name/issues",
+	"repository": "git+https://github.com/balbinus/companion-module-axia-xnode.git",
+	"bugs": "https://github.com/balbinus/companion-module-axia-xnode/issues",
 	"maintainers": [
 		{
-			"name": "Your name",
-			"email": "Your email"
+			"name": "Balbinus",
+			"email": "b@lbin.us"
 		}
 	],
 	"runtime": {
@@ -22,7 +22,7 @@
 		"entrypoint": "../dist/main.js"
 	},
 	"legacyIds": [],
-	"manufacturer": "Your company",
-	"products": ["Your product"],
-	"keywords": []
+	"manufacturer": "Axia Audio",
+	"products": ["xNode", "xNode2"],
+	"keywords": ["axia", "livewire", "lwrp", "xnode", "xnode2", "telos", "mixer", "aoip", "audio", "broadcast", "gpio"]
 }
