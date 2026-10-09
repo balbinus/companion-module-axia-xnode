@@ -1,15 +1,15 @@
+import type { CompanionVariableValues } from '@companion-module/base'
 import type ModuleInstance from './main.js'
+import type { StateChange } from './model/state.js'
 
-export type VariablesSchema = {
-	variable1: string
-	variable2: string
-	variable3: string
-}
+/** Variable ids are dynamic (per SRC/DST/mixer output...), hence the index signature. */
+export type VariablesSchema = CompanionVariableValues
 
 export function UpdateVariableDefinitions(self: ModuleInstance): void {
-	self.setVariableDefinitions({
-		variable1: { name: 'My first variable' },
-		variable2: { name: 'My second variable' },
-		variable3: { name: 'Another variable' },
-	})
+	self.setVariableDefinitions({})
+}
+
+/** Recompute the variables touched by `changes`, or all of them. */
+export function UpdateVariableValues(_self: ModuleInstance, _changes: StateChange[] | 'all'): void {
+	// TODO (agent D)
 }
