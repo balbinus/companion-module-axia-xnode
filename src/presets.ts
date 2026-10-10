@@ -84,6 +84,9 @@ function outputText(pair: MixPair, state: XNodeState): string {
 	return stacked(pairLabel(pair, false, state))
 }
 
+/** Short destination line for a crosspoint button: `→ SRC 3`, `→ Line 1` (no user name, to save space) */
+const toText = (out: MixPair): string => `→ ${pairLabel(out, false)}`
+
 const noSteps = { down: [], up: [] }
 
 /** Single-press button */
@@ -148,7 +151,7 @@ function addMixer(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 				`${prefix}_${out.id}_${inp.id}`,
 				pressButton(
 					`${outputText(out, state).replace('\\n', ' ')} <- ${pairLabel(inp, true, state)}`,
-					style(inputText(self, inp, state)),
+					style(`${inputText(self, inp, state)}\\n${toText(out)}`),
 					[{ actionId: 'mix_toggle', options: { ...opts, gain: 0 } }],
 					[{ feedbackId: 'mix_xpoint_active', options: xpoint(opts), style: onGreen }],
 				),
@@ -186,7 +189,7 @@ function addMixer(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 					`excl_${out.id}_${inp.id}`,
 					pressButton(
 						`Only ${pairLabel(inp, true, state)} → ${pairLabel(out, false, state)}`,
-						style(inputText(self, inp, state)),
+						style(`${inputText(self, inp, state)}\\n${toText(out)}`),
 						[{ actionId: 'mix_exclusive', options: { ...opts, gain: 0 } }],
 						[{ feedbackId: 'mix_output_exclusive', options: opts, style: onGreen }],
 					),
@@ -197,7 +200,7 @@ function addMixer(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 					`excl_${out.id}_off`,
 					pressButton(
 						`Clear ${pairLabel(out, false, state)}`,
-						style('CLEAR', 14, GREY),
+						style(`CLEAR\\n${toText(out)}`, 14, GREY),
 						[
 							{
 								actionId: 'mix_clear_output',
@@ -231,7 +234,7 @@ function addMixer(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 				return b.add(`rot_${out.id}_${inp.id}`, {
 					type: 'simple',
 					name: `Rotary ${pairLabel(inp, true, state)} → ${pairLabel(out, false, state)}`,
-					style: style(`${inputText(self, inp, state)}${gainVar}`),
+					style: style(`${inputText(self, inp, state)}\\n${toText(out)}${gainVar}`, gainVar ? 'auto' : 14),
 					steps: [
 						{
 							down: [{ actionId: 'mix_set', options: { ...opts, gain: 0 } }],
@@ -252,18 +255,29 @@ function addMixer(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 
 type GainTarget = { kind: 'dst' | 'src'; n: number }
 
+/** -1 dB / value / +1 dB. The value button doubles as the encoder preset: turn 0.5 dB per click, press for 0 dB. */
 function gainPresets(b: PresetBuilder, self: ModuleInstance, t: GainTarget): string[] {
 	const title = `${t.kind.toUpperCase()} ${t.n}`
-	const gainVar = `$(${self.label}:${t.kind}_${t.n}_gain)`
 	const adjust = (step: number): Action =>
 		t.kind === 'dst'
 			? { actionId: 'dst_gain_adjust', options: { dst: t.n, step } }
 			: { actionId: 'src_gain_adjust', options: { src: t.n, step } }
+	const reset: Action =
+		t.kind === 'dst'
+			? { actionId: 'dst_gain_set', options: { dst: t.n, gain: 0 } }
+			: { actionId: 'src_gain_set', options: { src: t.n, gain: 0 } }
+	const text = `${title}\\n$(${self.label}:${t.kind}_${t.n}_name)\\n$(${self.label}:${t.kind}_${t.n}_gain) dB`
 	const id = `gain_${t.kind}_${t.n}`
 	return [
-		b.add(`${id}_down`, pressButton(`${title} gain -1 dB`, style('-1 dB', 18), [adjust(-1)])),
-		b.add(`${id}_value`, indicator(`${title} gain`, style(`${title}\\n${gainVar} dB`), [])),
-		b.add(`${id}_up`, pressButton(`${title} gain +1 dB`, style('+1 dB', 18), [adjust(1)])),
+		b.add(`${id}_down`, pressButton(`${title} gain -1 dB`, style(`${title}\\n-1 dB`, 18), [adjust(-1)])),
+		b.add(`${id}_value`, {
+			type: 'simple',
+			name: `${title} gain (press: 0 dB, turn: ±0.5 dB)`,
+			style: style(text),
+			steps: [{ down: [reset], up: [], rotate_left: [adjust(-0.5)], rotate_right: [adjust(0.5)] }],
+			feedbacks: [],
+		} satisfies Preset),
+		b.add(`${id}_up`, pressButton(`${title} gain +1 dB`, style(`${title}\\n+1 dB`, 18), [adjust(1)])),
 	]
 }
 
@@ -272,48 +286,19 @@ function addGains(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 		Array.from({ length: count }, (_, i) => ({ kind, n: i + 1 }))
 	const groups = (list: GainTarget[]): CompanionPresetGroup<ModuleSchema>[] =>
 		list.map((t) => group(`gain_${t.kind}_${t.n}`, `${t.kind.toUpperCase()} ${t.n} gain`, gainPresets(b, self, t)))
+	const layout =
+		'-1 dB / value / +1 dB. The value button sets 0 dB when pressed; on an encoder (Stream Deck+ / Loupedeck) turning it changes the gain by 0.5 dB.'
 	b.section(
 		'gain_dst',
 		'Gain → destinations (DST output gain)',
-		'-1 dB / current value (display only) / +1 dB. Needs "Allow mixer & routing changes". xNode2 floor: -72 dB.',
+		`${layout} Needs "Allow mixer & routing changes". xNode2 floor: -72 dB.`,
 		groups(targets('dst', state.ndst)),
 	)
 	b.section(
 		'gain_src',
 		'Gain → sources (SRC input gain)',
-		'-1 dB / current value (display only) / +1 dB. Needs "Allow source (stream) changes".',
+		`${layout} Needs "Allow source (stream) changes".`,
 		groups(targets('src', state.nsrc)),
-	)
-
-	const rotary = (t: GainTarget): CompanionPresetGroup<ModuleSchema> => {
-		const title = `${t.kind.toUpperCase()} ${t.n}`
-		const rotate = (step: number): Action[] => [
-			t.kind === 'dst'
-				? { actionId: 'dst_gain_adjust', options: { dst: t.n, step } }
-				: { actionId: 'src_gain_adjust', options: { src: t.n, step } },
-		]
-		const reset: Action =
-			t.kind === 'dst'
-				? { actionId: 'dst_gain_set', options: { dst: t.n, gain: 0 } }
-				: { actionId: 'src_gain_set', options: { src: t.n, gain: 0 } }
-		const text =
-			t.kind === 'dst'
-				? `${title}\\n$(${self.label}:dst_${t.n}_name)\\n$(${self.label}:dst_${t.n}_gain) dB`
-				: `${title}\\n$(${self.label}:src_${t.n}_name)\\n$(${self.label}:src_${t.n}_gain) dB`
-		const pid = b.add(`rotgain_${t.kind}_${t.n}`, {
-			type: 'simple',
-			name: `Rotary ${title} gain`,
-			style: style(text),
-			steps: [{ down: [reset], up: [], rotate_left: rotate(-0.5), rotate_right: rotate(0.5) }],
-			feedbacks: [],
-		})
-		return group(`rotgain_${t.kind}_${t.n}`, `${title} rotary`, [pid])
-	}
-	b.section(
-		'gain_rotary',
-		'Gain → rotary (Stream Deck+ / Loupedeck)',
-		'Turn: gain in 0.5 dB steps. Press: back to 0 dB. DST gains need mixer & routing changes, SRC gains need source changes.',
-		[...targets('dst', state.ndst), ...targets('src', state.nsrc)].map(rotary),
 	)
 }
 
@@ -534,7 +519,7 @@ function addMic(b: PresetBuilder, self: ModuleInstance, state: XNodeState): void
 		const id = `mic_${n}`
 		const down = b.add(
 			`${id}_down`,
-			pressButton(`Mic INP ${n} gain -1 dB`, style('-1 dB', 18), [
+			pressButton(`Mic INP ${n} gain -1 dB`, style(`MIC ${n}\\n-1 dB`, 18), [
 				{ actionId: 'mic_gain_adjust', options: { inp: n, step: -1 } },
 			]),
 		)
@@ -546,7 +531,7 @@ function addMic(b: PresetBuilder, self: ModuleInstance, state: XNodeState): void
 		)
 		const up = b.add(
 			`${id}_up`,
-			pressButton(`Mic INP ${n} gain +1 dB`, style('+1 dB', 18), [
+			pressButton(`Mic INP ${n} gain +1 dB`, style(`MIC ${n}\\n+1 dB`, 18), [
 				{ actionId: 'mic_gain_adjust', options: { inp: n, step: 1 } },
 			]),
 		)

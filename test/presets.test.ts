@@ -188,12 +188,28 @@ describe('level_state presets only carry declared options', () => {
 	})
 })
 
+describe('mixer presets', () => {
+	it('every crosspoint button names both its input and its output', () => {
+		const f = build('xnode2-combo')
+		const xp = Object.entries<Any>(f.presets).filter(([id]) => /^(mix|mixsrc|excl|rot)_/.test(id))
+		expect(xp.length).toBeGreaterThan(0)
+		for (const [, p] of xp) expect(p.style.text).toMatch(/\\n→ \S/)
+	})
+})
+
 describe('gain and stream presets', () => {
-	it('the gain value button (centre of the trio) is display-only', () => {
+	it('the gain value button (centre of the trio) is also the encoder preset', () => {
 		const f = build('xnode2-combo')
 		const centre = Object.entries<Any>(f.presets).filter(([id]) => /^gain_(dst|src)_\d+_value$/.test(id))
 		expect(centre.length).toBeGreaterThan(0)
-		for (const [, p] of centre) expect(p.steps.every((s: Any) => s.down.length === 0 && s.up.length === 0)).toBe(true)
+		for (const [id, p] of centre) {
+			const kind = id.split('_')[1]
+			const [step] = p.steps
+			expect(step.down[0]).toMatchObject({ actionId: `${kind}_gain_set`, options: { gain: 0 } })
+			expect(step.rotate_left[0]).toMatchObject({ actionId: `${kind}_gain_adjust`, options: { step: -0.5 } })
+			expect(step.rotate_right[0]).toMatchObject({ actionId: `${kind}_gain_adjust`, options: { step: 0.5 } })
+		}
+		expect(f.sections.some((s) => s.id === 'gain_rotary')).toBe(false)
 	})
 
 	it('the -1 dB and +1 dB buttons adjust', () => {
@@ -208,9 +224,10 @@ describe('gain and stream presets', () => {
 		})
 	})
 
-	it('rotary press still sets 0 dB', () => {
+	it('the -1 dB and +1 dB buttons name their target', () => {
 		const f = build('legacy-analog4x4-a')
-		expect(f.presets.rotgain_dst_1.steps[0].down[0]).toMatchObject({ actionId: 'dst_gain_set', options: { gain: 0 } })
+		expect(f.presets.gain_dst_1_down.style.text).toMatch(/^DST 1\\n/)
+		expect(f.presets.gain_src_1_up.style.text).toMatch(/^SRC 1\\n/)
 	})
 
 	it('SRC stream toggles are not in the read-only Status section', () => {

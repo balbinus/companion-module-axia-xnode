@@ -66,8 +66,8 @@ Generated from the detected model (nothing but the device info before the first 
 
 - **Status**: device info, mixer factory mode, crosspoint budget, signal present / silence / clip per SRC and DST (and physical I/O on xNode2).
 - **Sources → stream on/off**: one toggle button per SRC (green when the stream is enabled). It writes, so it needs "Allow source (stream) changes".
-- **Mixer**: one page per physical output and per SRC stream with one button per input pair (toggle at 0 dB, green when active); exclusive-select rows (radio buttons); rotary presets for Stream Deck+ / Loupedeck (turn: gain, press: 0 dB). Turning up an off crosspoint turns it on starting from the configured minimum gain; pressing the encoder sets 0 dB.
-- **Gain**: -1 dB / value / +1 dB buttons and rotary presets per DST and SRC. The centre button only displays the value; the rotary press sets 0 dB.
+- **Mixer**: one page per physical output and per SRC stream with one button per input pair (toggle at 0 dB, green when active); exclusive-select rows (radio buttons); rotary presets for Stream Deck+ / Loupedeck (turn: gain, press: 0 dB). Every button shows its input and, on the last line, the output it feeds (`→ Line 1`), so it still makes sense away from its page. Turning up an off crosspoint turns it on starting from the configured minimum gain; pressing the encoder sets 0 dB.
+- **Gain**: -1 dB / value / +1 dB per DST (output gain) and per SRC (input gain). The value button shows the name and gain; pressing it sets 0 dB, and on an encoder (Stream Deck+ / Loupedeck) turning it changes the gain by 0.5 dB.
 - **DST routing**: one button per known source plus a disconnect button, per destination.
 - **GPIO** (nodes with GPIO): GPI indicators, GPO toggle and 500 ms pulse buttons (require "Allow GPO control").
 - **Microphone** (xNode2): gain buttons, red value while phantom power is on.
