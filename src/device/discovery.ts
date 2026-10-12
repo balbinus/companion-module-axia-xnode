@@ -20,14 +20,17 @@ export interface DiscoveryTimings {
 	usageDebounceMs: number
 	/** At most one log line per this period about datagrams that could not be used */
 	junkLogMs: number
+	/** Once listening, warn (once) if no device has been heard from after this long */
+	silenceWarnMs: number
 }
 
 export const DEFAULT_DISCOVERY_TIMINGS: DiscoveryTimings = {
 	expireEveryMs: 5000,
 	retryMs: 30_000,
-	sourcesDebounceMs: 2000,
+	sourcesDebounceMs: 5000, // names are not time critical
 	usageDebounceMs: 100,
 	junkLogMs: 60_000,
+	silenceWarnMs: 60_000,
 }
 
 export interface SourceDiscoveryOptions {
@@ -67,6 +70,11 @@ export class SourceDiscovery extends EventEmitter<SourceDiscoveryEvents> {
 	private junkTimer: NodeJS.Timeout | undefined
 	private sourcesTimer: NodeJS.Timeout | undefined
 	private usageTimer: NodeJS.Timeout | undefined
+	private silenceTimer: NodeJS.Timeout | undefined
+	/** The silence check has been scheduled in this run (it is done once per start) */
+	private silenceArmed = false
+	/** The "nothing heard" warning was logged and no advert has been decoded since */
+	private silenceWarned = false
 	/** Settles when the last listener released is closed */
 	private closing: Promise<void> = Promise.resolve()
 
@@ -79,12 +87,14 @@ export class SourceDiscovery extends EventEmitter<SourceDiscoveryEvents> {
 		this.directory = new LivewireDirectory(options.now ? { now: options.now } : {})
 	}
 
-	/** Start listening. No-op if started; the listener retries by itself when the network is not ready. */
+	/** Start listening. No-op if started; it retries by itself (see `retryMs`) when the network is not ready. */
 	start(): void {
 		if (this.running) return
 		this.running = true
 		this.up = false
 		this.lastError = undefined
+		this.silenceArmed = false
+		this.silenceWarned = false
 		this.directory.on('sources', this.onSources)
 		this.directory.on('usage', this.onUsage)
 		this.expireTimer = setInterval(this.expire, this.timings.expireEveryMs)
@@ -99,10 +109,17 @@ export class SourceDiscovery extends EventEmitter<SourceDiscoveryEvents> {
 	/** Stop listening and forget the directory. Idempotent; no event is emitted once it has been called. */
 	async stop(): Promise<void> {
 		this.running = false
-		for (const timer of [this.expireTimer, this.retryTimer, this.junkTimer, this.sourcesTimer, this.usageTimer]) {
-			clearTimeout(timer)
-		}
+		const timers = [
+			this.expireTimer,
+			this.retryTimer,
+			this.junkTimer,
+			this.sourcesTimer,
+			this.usageTimer,
+			this.silenceTimer,
+		]
+		for (const timer of timers) clearTimeout(timer)
 		this.expireTimer = this.retryTimer = this.junkTimer = this.sourcesTimer = this.usageTimer = undefined
+		this.silenceTimer = undefined
 		this.ignored = 0
 		this.ignoredError = undefined
 		this.directory.off('sources', this.onSources)
@@ -124,8 +141,12 @@ export class SourceDiscovery extends EventEmitter<SourceDiscoveryEvents> {
 		if (!this.running) return
 		try {
 			const advert = decodeAdvert(buf, rinfo.address)
-			if (advert) this.directory.ingest(advert)
-			else this.ignore(undefined)
+			if (advert) {
+				this.directory.ingest(advert)
+				this.heard()
+			} else {
+				this.ignore(undefined)
+			}
 		} catch (e) {
 			this.ignore(e instanceof Error ? e.message : String(e))
 		}
@@ -139,6 +160,30 @@ export class SourceDiscovery extends EventEmitter<SourceDiscoveryEvents> {
 			'info',
 			`Listening for Livewire adverts on ${PARTYLINE_GROUP}:${PARTYLINE_PORT} (interface ${this.interfaceIp || 'default'})`,
 		)
+		if (!this.silenceArmed) {
+			this.silenceArmed = true
+			this.silenceTimer = setTimeout(this.checkSilence, this.timings.silenceWarnMs)
+		}
+	}
+
+	/** Listening for a while without hearing any device: the usual cause is the network setup, not the devices */
+	private readonly checkSilence = (): void => {
+		this.silenceTimer = undefined
+		if (!this.running || this.directory.deviceCount() > 0) return
+		this.silenceWarned = true
+		this.log(
+			'warn',
+			`No Livewire advertisement received on ${PARTYLINE_GROUP}:${PARTYLINE_PORT} (interface ${this.interfaceIp || 'default'}) ` +
+				`after ${Math.round(this.timings.silenceWarnMs / 1000)} s: check the interface IP, Docker host networking, ` +
+				'and that the firewall allows UDP 4001 multicast',
+		)
+	}
+
+	/** An advert was decoded: say so if the silence warning was logged */
+	private heard(): void {
+		if (!this.silenceWarned) return
+		this.silenceWarned = false
+		this.log('info', 'Livewire advertisements are now being received')
 	}
 
 	private readonly onError = (err: Error): void => {

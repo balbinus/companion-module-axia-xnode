@@ -157,11 +157,11 @@ describe('events', () => {
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
 		expect(r.events).toEqual([])
-		vi.advanceTimersByTime(1999)
+		vi.advanceTimersByTime(4999)
 		expect(r.events).toEqual([])
 		vi.advanceTimersByTime(1)
 		expect(r.events).toEqual(['sources'])
-		vi.advanceTimersByTime(60_000 - 2000 - 5000)
+		vi.advanceTimersByTime(60_000 - 5000 - 5000)
 		expect(r.events).toEqual(['sources'])
 	})
 
@@ -169,7 +169,7 @@ describe('events', () => {
 		const r = rig()
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(1500)
+		vi.advanceTimersByTime(4500)
 		r.listener().fixture('full-xnode-223-renamed')
 		r.listener().fixture('full-xnode-224', '10.96.30.224')
 		vi.advanceTimersByTime(500)
@@ -179,7 +179,7 @@ describe('events', () => {
 		// the next change starts a new window
 		vi.advanceTimersByTime(10_000)
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		expect(r.events).toEqual(['sources', 'sources'])
 	})
 
@@ -202,7 +202,7 @@ describe('events', () => {
 		const r = rig()
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		r.events.length = 0
 		r.listener().fixture('keepalive-xnode')
 		r.listener().fixture('full-xnode-223')
@@ -225,7 +225,7 @@ describe('events', () => {
 		const r = rig()
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		expect(r.events).toEqual(['sources'])
 		// expiry is checked every 5 s and happens after 60 s without an advert
 		vi.advanceTimersByTime(70_000)
@@ -252,7 +252,7 @@ describe('events', () => {
 		})
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
-		expect(() => vi.advanceTimersByTime(2000)).not.toThrow()
+		expect(() => vi.advanceTimersByTime(5000)).not.toThrow()
 		expect(r.logged('warn')).toEqual(["Livewire discovery: a 'sources' listener failed: listener bug"])
 		expect(r.events).toEqual(['sources']) // the listener registered before it ran
 	})
@@ -327,6 +327,145 @@ describe('unusable datagrams', () => {
 		await r.discovery.stop()
 		vi.advanceTimersByTime(120_000)
 		expect(r.logs).toEqual([])
+	})
+})
+
+describe('silence', () => {
+	const WARNING =
+		'No Livewire advertisement received on 239.192.255.3:4001 (interface default) after 60 s: ' +
+		'check the interface IP, Docker host networking, and that the firewall allows UDP 4001 multicast'
+
+	it('warns once, silenceWarnMs after the listener is up, when no device was heard', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(59_999)
+		expect(r.logged('warn')).toEqual([])
+		vi.advanceTimersByTime(1)
+		expect(r.logged('warn')).toEqual([WARNING])
+		vi.advanceTimersByTime(600_000)
+		expect(r.logged('warn')).toEqual([WARNING])
+	})
+
+	it('names the interface', () => {
+		const r = rig({ interfaceIp: '10.96.30.50' })
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(60_000)
+		expect(r.logged('warn')).toEqual([WARNING.replace('(interface default)', '(interface 10.96.30.50)')])
+	})
+
+	it('waits for the listener to be up: nothing while it is failing', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('error', new Error('ENODEV'))
+		vi.advanceTimersByTime(30_000) // the retry
+		r.listener().emit('error', new Error('ENODEV'))
+		vi.advanceTimersByTime(29_000) // 59 s after the start, not yet after the join
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(59_999)
+		expect(r.logged('warn')).toEqual(['Livewire advert listener: ENODEV'])
+		vi.advanceTimersByTime(1)
+		expect(r.logged('warn')).toEqual(['Livewire advert listener: ENODEV', WARNING])
+	})
+
+	it('does not warn when a device was heard (a keepalive is enough)', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		r.listener().fixture('keepalive-xnode')
+		for (let i = 0; i < 12; i++) {
+			vi.advanceTimersByTime(10_000)
+			r.listener().fixture('keepalive-xnode')
+		}
+		expect(r.logged('warn')).toEqual([])
+		expect(r.logged('info')).toHaveLength(1) // "Listening", and no "now received"
+	})
+
+	it('unusable datagrams are not adverts', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		r.listener().datagram(Buffer.from('junk'))
+		vi.advanceTimersByTime(60_000)
+		expect(r.logged('warn')).toEqual([WARNING])
+		r.listener().datagram(Buffer.from('junk'))
+		expect(r.logged('info')).toHaveLength(1)
+	})
+
+	it('says so, once, when adverts start arriving after the warning', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(60_000)
+		r.listener().fixture('full-xnode-223')
+		expect(r.logged('info')).toEqual([
+			'Listening for Livewire adverts on 239.192.255.3:4001 (interface default)',
+			'Livewire advertisements are now being received',
+		])
+		r.listener().fixture('keepalive-xnode')
+		r.listener().fixture('full-xnode-224', '10.96.30.224')
+		expect(r.logged('info')).toHaveLength(2)
+		expect(r.logged('warn')).toEqual([WARNING])
+	})
+
+	it('warns at most once per start: not again if the directory empties later', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(60_000)
+		r.listener().fixture('keepalive-xnode')
+		vi.advanceTimersByTime(600_000) // the device expires
+		expect(r.discovery.directory.deviceCount()).toBe(0)
+		expect(r.logged('warn')).toEqual([WARNING])
+	})
+
+	it('honours a custom delay', () => {
+		const r = rig({ timings: { silenceWarnMs: 1500 } })
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(1499)
+		expect(r.logged('warn')).toEqual([])
+		vi.advanceTimersByTime(1)
+		expect(r.logged('warn')).toEqual([WARNING.replace('after 60 s', 'after 2 s')])
+	})
+
+	it('stop() clears the timer: no warning afterwards', async () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		expect(vi.getTimerCount()).toBe(2) // expiry interval and silence check
+		await r.discovery.stop()
+		expect(vi.getTimerCount()).toBe(0)
+		vi.advanceTimersByTime(600_000)
+		expect(r.logged('warn')).toEqual([])
+	})
+
+	it('a new start gets its own check and its own warning', async () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(60_000)
+		await r.discovery.stop()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(59_999)
+		expect(r.logged('warn')).toEqual([WARNING])
+		vi.advanceTimersByTime(1)
+		expect(r.logged('warn')).toEqual([WARNING, WARNING])
+		// and an advert after the second warning gets its "now received", not hidden by the first run's
+		r.listener().fixture('keepalive-xnode')
+		expect(r.logged('info').at(-1)).toBe('Livewire advertisements are now being received')
+	})
+
+	it('is not re-armed by a second "listening" of the same run', () => {
+		const r = rig()
+		r.discovery.start()
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(30_000)
+		r.listener().emit('listening')
+		vi.advanceTimersByTime(30_000)
+		expect(r.logged('warn')).toEqual([WARNING])
 	})
 })
 
@@ -424,7 +563,7 @@ describe('listener failures', () => {
 	})
 
 	it('an error after listening is only logged: the socket is kept', () => {
-		const r = rig()
+		const r = rig({ timings: { silenceWarnMs: 10_000_000 } })
 		r.discovery.start()
 		r.listener().emit('listening')
 		r.listener().emit('error', failure('ENETDOWN'))
@@ -506,7 +645,7 @@ describe('stop', () => {
 		const r = rig()
 		r.discovery.start()
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		r.events.length = 0
 		await r.discovery.stop()
 		vi.advanceTimersByTime(10_000)
@@ -544,7 +683,7 @@ describe('restart', () => {
 		r.discovery.start()
 		r.listener().emit('listening')
 		r.listener().fixture('full-xnode-223')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		await r.discovery.stop()
 		r.events.length = 0
 
@@ -557,7 +696,7 @@ describe('restart', () => {
 
 		r.listener().fixture('full-xnode-224', '10.96.30.224')
 		r.listener().fixture('usage-xnode-fader11')
-		vi.advanceTimersByTime(2000)
+		vi.advanceTimersByTime(5000)
 		expect(r.events).toEqual(['usage', 'sources'])
 		expect(r.discovery.directory.sources().map((s) => s.deviceIp)).toEqual(Array(8).fill('10.96.30.224'))
 		expect(r.discovery.directory.usedBy(22301)).toEqual({ engineIp: '10.96.30.235', fader: 11 })
@@ -647,10 +786,10 @@ describe('with the real PartylineListener', () => {
 
 		sockets[1].emit('message', partylineFixture('full-xnode-223'), { address: '10.96.30.223' })
 		expect(r.discovery.directory.sources()).toHaveLength(8)
-		await vi.advanceTimersByTimeAsync(2000)
+		await vi.advanceTimersByTimeAsync(5000)
 		expect(r.events).toEqual(['sources'])
 
-		await vi.advanceTimersByTimeAsync(300_000 - 2000)
+		await vi.advanceTimersByTimeAsync(300_000 - 5000)
 		expect(sockets).toHaveLength(2) // up: no more retries
 		await r.discovery.stop()
 		expect(sockets[1].close).toHaveBeenCalled()
