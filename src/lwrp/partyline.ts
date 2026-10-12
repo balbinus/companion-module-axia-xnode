@@ -16,7 +16,7 @@ export interface AdvertisedSource {
 	slot: string
 	/** PSID: Livewire channel number */
 	channel: number
-	/** PSNM, cut at the first NUL and trimmed */
+	/** PSNM, cut at the first NUL, control characters dropped, trimmed */
 	name: string
 	/** FSID, dotted quad: the source's audio (239.192.x.y; 239.193.x.y for a console's backfeed source) */
 	streamAddress: string
@@ -97,10 +97,16 @@ function addressOf(src: CMsg2Message, key: string): string {
 	return n ? dottedQuad(n) : ''
 }
 
+/** PSID as a channel: a u32 on the wire, but a Livewire channel is 1..65535 (it maps to 239.192.hi.lo) */
+function channelOf(src: CMsg2Message): number | undefined {
+	const n = leafNumber(src, 'PSID', CMSG2_TYPE.INT32)
+	return n !== undefined && n >= 1 && n <= 0xffff ? n : undefined
+}
+
 function decodeSources(msg: CMsg2Message): AdvertisedSource[] {
 	const out: AdvertisedSource[] = []
 	for (const [slot, src] of slots(msg)) {
-		const channel = leafNumber(src, 'PSID', CMSG2_TYPE.INT32)
+		const channel = channelOf(src)
 		if (channel === undefined) continue
 		out.push({
 			slot,
@@ -124,7 +130,7 @@ function decodeBusy(busy: bigint): SourceUser | null {
 function decodeUsage(msg: CMsg2Message): SourceUsage[] {
 	const out: SourceUsage[] = []
 	for (const [, src] of slots(msg)) {
-		const channel = leafNumber(src, 'PSID', CMSG2_TYPE.INT32)
+		const channel = channelOf(src)
 		const busy = leafBigInt(src, 'BUSY')
 		if (channel === undefined || busy === undefined) continue
 		out.push({ channel, usedBy: decodeBusy(busy) })

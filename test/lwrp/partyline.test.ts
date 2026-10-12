@@ -330,6 +330,17 @@ describe('decodeAdvert: sources', () => {
 		expect(a?.sources.map((s) => [s.slot, s.channel, s.name])).toEqual([['S002', 22302, 'ok']])
 	})
 
+	it('skips sources and usage whose PSID is not a channel (1..65535)', () => {
+		const ids = [0, 1, 0xffff, 0x10000, 0xffffffff]
+		const full = decodeAdvert(nest(1, [], ...ids.map((id, i) => src(`S00${i}`, u32('PSID', id)))), '1.1.1.1')
+		expect(full?.sources.map((s) => s.channel)).toEqual([1, 0xffff])
+		const usage = decodeAdvert(
+			nest(3, [], ...ids.map((id, i) => src(`S00${i}`, u32('PSID', id), u64('BUSY', 0n)))),
+			'1.1.1.1',
+		)
+		expect(usage?.usage.map((u) => u.channel)).toEqual([1, 0xffff])
+	})
+
 	it('names a source without PSNM as an empty string; missing addresses stay empty too', () => {
 		const a = decodeAdvert(nest(1, [], src('S001', u32('PSID', 5))), '1.1.1.1')
 		expect(a?.sources).toEqual([{ slot: 'S001', channel: 5, name: '', streamAddress: '', backfeedAddress: '' }])
@@ -639,12 +650,12 @@ describe('decodeAdvert: every single-byte mutation of real packets', () => {
 		check(a.sourceCount === undefined || isInt(a.sourceCount, 0, 0xffff), `sourceCount ${a.sourceCount}`)
 		check(a.deviceName === undefined || cleanName(a.deviceName), `deviceName ${JSON.stringify(a.deviceName)}`)
 		for (const s of a.sources) {
-			check(isInt(s.channel, 0, u32max), `channel ${s.channel}`)
+			check(isInt(s.channel, 1, 0xffff), `channel ${s.channel}`)
 			check(cleanName(s.name), `source name ${JSON.stringify(s.name)}`)
 			for (const addr of [s.streamAddress, s.backfeedAddress]) check(addr === '' || QUAD.test(addr), `address ${addr}`)
 		}
 		for (const u of a.usage) {
-			check(isInt(u.channel, 0, u32max), `usage channel ${u.channel}`)
+			check(isInt(u.channel, 1, 0xffff), `usage channel ${u.channel}`)
 			if (u.usedBy) {
 				check(QUAD.test(u.usedBy.engineIp), `engineIp ${u.usedBy.engineIp}`)
 				check(isInt(u.usedBy.fader, 1, 65536), `fader ${u.usedBy.fader}`)
