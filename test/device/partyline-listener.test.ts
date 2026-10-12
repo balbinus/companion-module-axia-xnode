@@ -3,7 +3,7 @@ import { EventEmitter, once } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PartylineListener, type PartylineListenerOptions } from '../../src/device/partyline-listener.js'
 import { PARTYLINE_GROUP, PARTYLINE_PORT } from '../../src/lwrp/partyline.js'
-import { waitFor } from '../helpers/wait-for.js'
+import { sleep, waitFor } from '../helpers/wait-for.js'
 
 /** A dgram.Socket stand-in: the test decides when the bind callback fires and when close completes */
 class FakeSocket extends EventEmitter {
@@ -252,6 +252,96 @@ describe('errors', () => {
 	})
 })
 
+describe('throwing handlers', () => {
+	it('reports an exception thrown by a message handler as error instead of letting it escape', () => {
+		const { listener, sockets, errors, events } = rig()
+		listener.on('message', () => {
+			throw new Error('handler boom')
+		})
+		listener.start()
+		sockets[0].listen()
+		expect(() => sockets[0].emit('message', Buffer.from('x'), rinfo)).not.toThrow()
+		expect(errors.map((e) => e.message)).toEqual(['handler boom'])
+		// the listener stays up and keeps delivering
+		expect(sockets[0].close).not.toHaveBeenCalled()
+		sockets[0].emit('message', Buffer.from('y'), rinfo)
+		expect(events).toEqual(['listening', 'message', 'error', 'message', 'error'])
+	})
+
+	it('reports an exception thrown by a listening handler, and stays up', () => {
+		const { listener, sockets, errors, messages } = rig()
+		listener.on('listening', () => {
+			throw new Error('listening boom')
+		})
+		listener.start()
+		expect(() => sockets[0].listen()).not.toThrow()
+		expect(errors.map((e) => e.message)).toEqual(['listening boom'])
+		expect(sockets[0].close).not.toHaveBeenCalled()
+		sockets[0].emit('message', Buffer.from('x'), rinfo)
+		expect(messages).toHaveLength(1)
+		// still joined: stop() leaves the group
+		void listener.stop()
+		expect(sockets[0].dropMembership).toHaveBeenCalledTimes(1)
+	})
+
+	it('wraps a non-Error thrown by a handler', () => {
+		const { listener, sockets, errors } = rig()
+		listener.on('message', () => {
+			throw 'plain string' // eslint-disable-line @typescript-eslint/only-throw-error
+		})
+		listener.start()
+		sockets[0].listen()
+		sockets[0].emit('message', Buffer.from('x'), rinfo)
+		expect(errors[0]).toBeInstanceOf(Error)
+		expect(errors[0].message).toBe('plain string')
+	})
+
+	it('drops what a throwing error handler throws, without reporting it again', () => {
+		const { listener, sockets } = rig()
+		const onError = vi.fn(() => {
+			throw new Error('error handler boom')
+		})
+		listener.on('error', onError)
+		listener.on('message', () => {
+			throw new Error('handler boom')
+		})
+		listener.start()
+		sockets[0].listen()
+		expect(() => sockets[0].emit('message', Buffer.from('x'), rinfo)).not.toThrow()
+		// the recording handler of the rig comes first and sees it; the throwing one is called once, not recursively
+		expect(onError).toHaveBeenCalledTimes(1)
+		// a socket error goes through the same path
+		expect(() => sockets[0].emit('error', new Error('recv ENETDOWN'))).not.toThrow()
+		expect(onError).toHaveBeenCalledTimes(2)
+	})
+
+	it('drops a handler exception when nobody listens for errors', () => {
+		const { listener, sockets } = rig({}, { errorHandler: false })
+		listener.on('message', () => {
+			throw new Error('handler boom')
+		})
+		listener.start()
+		sockets[0].listen()
+		expect(() => sockets[0].emit('message', Buffer.from('x'), rinfo)).not.toThrow()
+	})
+
+	it('reports a failure to join even when the error handler throws', () => {
+		const { listener, sockets } = rig()
+		listener.on('error', () => {
+			throw new Error('error handler boom')
+		})
+		listener.start()
+		sockets[0].addMembership.mockImplementation(() => {
+			throw new Error('ENODEV')
+		})
+		expect(() => sockets[0].listen()).not.toThrow()
+		// the socket was still given up
+		expect(sockets[0].close).toHaveBeenCalledTimes(1)
+		listener.start()
+		expect(sockets).toHaveLength(2)
+	})
+})
+
 describe('stop', () => {
 	it('leaves the group, closes the socket and resolves when closed', async () => {
 		const { listener, sockets } = rig({ group: '239.1.2.3', interfaceIp: '10.96.30.100' })
@@ -336,6 +426,21 @@ describe('stop', () => {
 		})
 		await expect(listener.stop()).resolves.toBeUndefined()
 		expect(sockets[0].close).toHaveBeenCalledTimes(1)
+	})
+
+	it('may be called from inside a listening handler', async () => {
+		const { listener, sockets, events } = rig()
+		let stopped: Promise<void> | undefined
+		listener.once('listening', () => {
+			stopped = listener.stop()
+		})
+		listener.start()
+		sockets[0].listen()
+		await stopped
+		expect(sockets[0].dropMembership).toHaveBeenCalledTimes(1)
+		expect(sockets[0].close).toHaveBeenCalledTimes(1)
+		sockets[0].emit('message', Buffer.from('late'), rinfo)
+		expect(events).toEqual(['listening'])
 	})
 
 	it('can be started again with a fresh socket', async () => {
@@ -430,6 +535,145 @@ describe('with a real socket', () => {
 		await sendTo(port, Buffer.from('two'))
 		await waitFor(() => received.length === 2, { message: 'datagram after restart' })
 		expect(received).toEqual(['one', 'two'])
+	})
+
+	/** Fails the test if anything escapes into the process, as an owner's exception in a dgram callback would */
+	function watchUncaught(): unknown[] {
+		const uncaught: unknown[] = []
+		const onUncaught = (e: unknown): number => uncaught.push(e)
+		process.on('uncaughtException', onUncaught)
+		cleanups.push(async () => {
+			process.off('uncaughtException', onUncaught)
+		})
+		return uncaught
+	}
+
+	it('survives a message handler that throws: reported as error, nothing reaches the process', async () => {
+		const port = await freePort()
+		const listener = realListener(port)
+		const uncaught = watchUncaught()
+		const errors: Error[] = []
+		listener.on('error', (err) => errors.push(err))
+		listener.on('message', () => {
+			throw new Error('handler boom')
+		})
+		const listening = once(listener, 'listening')
+		listener.start()
+		await listening
+		await sendTo(port, Buffer.from('one'))
+		await waitFor(() => errors.length === 1, { message: 'first error' })
+		// still receiving after the exception
+		await sendTo(port, Buffer.from('two'))
+		await waitFor(() => errors.length === 2, { message: 'second error' })
+		await sleep(30)
+		expect(errors.map((e) => e.message)).toEqual(['handler boom', 'handler boom'])
+		expect(uncaught).toEqual([])
+	})
+
+	it('survives a listening handler that throws, and keeps receiving', async () => {
+		const port = await freePort()
+		const listener = realListener(port)
+		const uncaught = watchUncaught()
+		const errors: Error[] = []
+		const received: string[] = []
+		listener.on('error', (err) => errors.push(err))
+		listener.on('message', (buf) => received.push(buf.toString()))
+		listener.on('listening', () => {
+			throw new Error('listening boom')
+		})
+		listener.start()
+		await waitFor(() => errors.length === 1, { message: 'error from the listening handler' })
+		await sendTo(port, Buffer.from('after'))
+		await waitFor(() => received.length === 1, { message: 'datagram' })
+		await sleep(30)
+		expect(errors.map((e) => e.message)).toEqual(['listening boom'])
+		expect(uncaught).toEqual([])
+	})
+
+	it('survives an error handler that throws as well', async () => {
+		const port = await freePort()
+		const listener = realListener(port)
+		const uncaught = watchUncaught()
+		let errorCalls = 0
+		listener.on('error', () => {
+			errorCalls++
+			throw new Error('error handler boom')
+		})
+		listener.on('message', () => {
+			throw new Error('handler boom')
+		})
+		const listening = once(listener, 'listening')
+		listener.start()
+		await listening
+		await sendTo(port, Buffer.from('one'))
+		await waitFor(() => errorCalls === 1, { message: 'error handler call' })
+		await sendTo(port, Buffer.from('two'))
+		await waitFor(() => errorCalls === 2, { message: 'second error handler call' })
+		await sleep(30)
+		expect(errorCalls).toBe(2)
+		expect(uncaught).toEqual([])
+		await expect(listener.stop()).resolves.toBeUndefined()
+	})
+
+	it('lets two listeners share the port (reuseAddr): both reach listening', async () => {
+		const port = await freePort()
+		const first = realListener(port)
+		const second = realListener(port)
+		const errors: Error[] = []
+		first.on('error', (err) => errors.push(err))
+		second.on('error', (err) => errors.push(err))
+		const firstListening = once(first, 'listening')
+		first.start()
+		await firstListening
+		const secondListening = once(second, 'listening')
+		second.start()
+		await secondListening
+		expect(errors).toEqual([])
+	})
+
+	it('emits error, not a throw, when the interface does not exist (real addMembership)', async () => {
+		const port = await freePort()
+		// No test seam: the OS refuses the membership (ENODEV or EADDRNOTAVAIL, depending on the platform)
+		const listener = new PartylineListener({ port, interfaceIp: '10.9.9.9' })
+		cleanups.push(async () => listener.stop())
+		const errors: Error[] = []
+		const events: string[] = []
+		listener.on('error', (err) => errors.push(err))
+		listener.on('listening', () => events.push('listening'))
+		expect(() => listener.start()).not.toThrow()
+		await waitFor(() => errors.length === 1, { message: 'error event' })
+		expect(errors[0]).toBeInstanceOf(Error)
+		expect(events).toEqual([])
+		// the socket was given up, so that start() can try again
+		expect(() => listener.start()).not.toThrow()
+		await waitFor(() => errors.length === 2, { message: 'error event after retry' })
+		await expect(listener.stop()).resolves.toBeUndefined()
+	})
+
+	it('may stop() from inside a listening handler, and be started again', async () => {
+		const port = await freePort()
+		const listener = realListener(port)
+		const errors: Error[] = []
+		const received: string[] = []
+		listener.on('error', (err) => errors.push(err))
+		listener.on('message', (buf) => received.push(buf.toString()))
+		const stopped = new Promise<void>((resolve) => {
+			listener.once('listening', () => resolve(listener.stop()))
+		})
+		listener.start()
+		await stopped
+		await sendTo(port, Buffer.from('late'))
+		await sleep(30)
+		expect(received).toEqual([])
+		expect(errors).toEqual([])
+
+		const again = once(listener, 'listening')
+		listener.start()
+		await again
+		await sendTo(port, Buffer.from('back'))
+		await waitFor(() => received.length === 1, { message: 'datagram after restart' })
+		expect(received).toEqual(['back'])
+		expect(errors).toEqual([])
 	})
 
 	it('receives nothing after stop', async () => {

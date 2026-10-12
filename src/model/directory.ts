@@ -5,6 +5,11 @@ import type { AdvertisedSource, PartylineAdvert, SourceUser } from '../lwrp/part
  * The Livewire source directory: what the network's devices advertise on the partyline (see lwrp/partyline.ts).
  * Pure model: no sockets and no timers. The owner feeds it decoded adverts, calls `expire()` periodically and
  * debounces the events.
+ *
+ * Events are emitted synchronously, after the new state is in place, never nested: a listener may call
+ * `ingest()`, `expire()` or `clear()`. That updates the state at once (so `sources()` is current), and what it
+ * changed is announced when the running emit round ends, coalesced into one more round. If a listener throws, the
+ * other event is still emitted and the first error is rethrown by the call that triggered the emission.
  */
 
 export interface DirectorySource extends AdvertisedSource {
@@ -15,7 +20,7 @@ export interface DirectorySource extends AdvertisedSource {
 export interface LivewireDirectoryOptions {
 	/** A device not heard from for more than this is dropped by `expire()` (default 60 s) */
 	expiryMs?: number
-	/** Clock, for tests (default Date.now) */
+	/** Monotonic clock in ms, for tests (default performance.now: immune to wall-clock steps, e.g. NTP) */
 	now?: () => number
 }
 
@@ -27,9 +32,16 @@ export interface DirectoryEvents {
 }
 
 export const DEFAULT_EXPIRY_MS = 60_000
+/**
+ * A split full advert arrives within milliseconds. A pending set older than this when another full datagram
+ * arrives is abandoned: a lost datagram must not let slots of an earlier cycle complete the next one.
+ */
+export const PENDING_MAX_AGE_MS = 10_000
 
 interface PendingAdvert {
 	configVersion: number | undefined
+	/** When the first datagram of the set arrived */
+	startedAt: number
 	/** Gathered so far, by slot */
 	slots: Map<string, AdvertisedSource>
 }
@@ -38,7 +50,6 @@ interface Device {
 	ip: string
 	/** Defaults to the IP until an advert carries the name */
 	name: string
-	hwid?: number
 	lastSeen: number
 	committed: AdvertisedSource[]
 	pending: PendingAdvert | null
@@ -64,19 +75,35 @@ function compareSources(a: DirectorySource, b: DirectorySource): number {
 	return a.channel - b.channel || compareIp(a.deviceIp, b.deviceIp) || (a.slot < b.slot ? -1 : a.slot > b.slot ? 1 : 0)
 }
 
+/** Every DirectorySource field: a field missing from this literal does not compile, so none escapes `sameSource` */
+const SOURCE_FIELDS = Object.keys({
+	slot: 0,
+	channel: 0,
+	name: 0,
+	streamAddress: 0,
+	backfeedAddress: 0,
+	deviceIp: 0,
+	deviceName: 0,
+} satisfies Record<keyof DirectorySource, 0>) as Array<keyof DirectorySource>
+
 function sameSource(a: DirectorySource, b: DirectorySource): boolean {
-	return (
-		a.slot === b.slot &&
-		a.channel === b.channel &&
-		a.name === b.name &&
-		a.streamAddress === b.streamAddress &&
-		a.backfeedAddress === b.backfeedAddress &&
-		a.deviceIp === b.deviceIp &&
-		a.deviceName === b.deviceName
-	)
+	return SOURCE_FIELDS.every((field) => a[field] === b[field])
 }
 
-function sameUsage(a: Map<number, SourceUser>, b: Map<number, SourceUser>): boolean {
+/** What a device reports for a channel: the claim on its user, to settle between devices reporting different ones */
+interface UsageClaim {
+	user: SourceUser
+	/** The device advertises the channel as a regular source (not as the backfeed of another device's) */
+	owns: boolean
+	ip: string
+}
+
+/** Total order: the owner of the source first, then the lowest IP */
+function claimBeats(a: UsageClaim, b: UsageClaim): boolean {
+	return a.owns !== b.owns ? a.owns : compareIp(a.ip, b.ip) < 0
+}
+
+function sameUsage(a: Map<number, Readonly<SourceUser>>, b: Map<number, Readonly<SourceUser>>): boolean {
 	if (a.size !== b.size) return false
 	for (const [channel, user] of a) {
 		const other = b.get(channel)
@@ -90,13 +117,17 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 	private readonly now: () => number
 	private readonly devices = new Map<string, Device>()
 	/** What `sources()` / `usedBy()` currently report: events fire when a recomputation differs from these */
-	private list: DirectorySource[] = []
-	private usage = new Map<number, SourceUser>()
+	private list: ReadonlyArray<Readonly<DirectorySource>> = []
+	private usage = new Map<number, Readonly<SourceUser>>()
+	/** Changes not announced yet; `flush()` empties them */
+	private sourcesDirty = false
+	private usageDirty = false
+	private flushing = false
 
 	constructor(options: LivewireDirectoryOptions = {}) {
 		super()
 		this.expiryMs = options.expiryMs ?? DEFAULT_EXPIRY_MS
-		this.now = options.now ?? Date.now
+		this.now = options.now ?? (() => performance.now())
 	}
 
 	/** Feed one decoded advert */
@@ -113,8 +144,8 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 			}
 			this.devices.set(advert.deviceIp, device)
 		}
-		device.lastSeen = this.now()
-		if (advert.hwid !== undefined) device.hwid = advert.hwid
+		const now = this.now()
+		device.lastSeen = now
 		let changed = false
 		if (advert.deviceName && advert.deviceName !== device.name) {
 			device.name = advert.deviceName
@@ -122,7 +153,7 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 		}
 
 		if (advert.kind === 'full') {
-			changed = this.gather(device, advert) || changed
+			changed = this.gather(device, advert, now) || changed
 		} else if (advert.kind === 'usage') {
 			device.usage = new Map(advert.usage.map((u) => [u.channel, u.usedBy]))
 			changed = true
@@ -144,8 +175,8 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 		if (removed) this.refresh()
 	}
 
-	/** Committed sources, sorted by channel then device IP */
-	sources(): DirectorySource[] {
+	/** Committed sources, sorted by channel then device IP. The entries are frozen. */
+	sources(): ReadonlyArray<Readonly<DirectorySource>> {
 		return [...this.list]
 	}
 
@@ -153,7 +184,7 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 	 * What advertises this multicast address. Priority: a source's own stream (`from`), then the backfeed of a
 	 * source (`to`), then a console's backfeed source, whose stream is its backfeed address (`from`).
 	 */
-	lookupAddress(ip: string): { source: DirectorySource; kind: 'from' | 'to' } | undefined {
+	lookupAddress(ip: string): { source: Readonly<DirectorySource>; kind: 'from' | 'to' } | undefined {
 		const addr = ip.trim()
 		for (const source of this.list) {
 			if (source.streamAddress === addr && source.streamAddress !== source.backfeedAddress)
@@ -169,8 +200,8 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 		return undefined
 	}
 
-	/** The console engine using this channel's source (BUSY); null when unused or unknown */
-	usedBy(channel: number): SourceUser | null {
+	/** The console engine using this channel's source (BUSY); null when unused or unknown. The result is frozen. */
+	usedBy(channel: number): Readonly<SourceUser> | null {
 		return this.usage.get(channel) ?? null
 	}
 
@@ -182,10 +213,16 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 	}
 
 	/** Merge a full advert into the device's pending set; commits it when complete. Returns true on a commit. */
-	private gather(device: Device, advert: PartylineAdvert): boolean {
-		// A different configVersion (either direction: it restarts on reboot) abandons what was gathered
-		if (!device.pending || device.pending.configVersion !== advert.configVersion) {
-			device.pending = { configVersion: advert.configVersion, slots: new Map() }
+	private gather(device: Device, advert: PartylineAdvert, now: number): boolean {
+		// A different configVersion (either direction: it restarts on reboot) abandons what was gathered, and so
+		// does a set that has been waiting too long: its missing datagram is lost, and slots that changed since
+		// without a version bump must not complete the next cycle
+		if (
+			!device.pending ||
+			device.pending.configVersion !== advert.configVersion ||
+			now - device.pending.startedAt > PENDING_MAX_AGE_MS
+		) {
+			device.pending = { configVersion: advert.configVersion, startedAt: now, slots: new Map() }
 		}
 		const pending = device.pending
 		for (const source of advert.sources) pending.slots.set(source.slot, source)
@@ -195,26 +232,71 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 		return true
 	}
 
-	/** Recompute the public view and emit for what changed */
+	/** Recompute the public view and announce what changed */
 	private refresh(): void {
-		const list: DirectorySource[] = []
-		const usage = new Map<number, SourceUser>()
+		const list: Array<Readonly<DirectorySource>> = []
+		const claims = new Map<number, UsageClaim>()
 		for (const device of this.devices.values()) {
+			const owned = new Set<number>()
 			for (const source of device.committed) {
-				list.push({ ...source, deviceIp: device.ip, deviceName: device.name })
+				list.push(Object.freeze({ ...source, deviceIp: device.ip, deviceName: device.name }))
+				if (source.streamAddress !== source.backfeedAddress) owned.add(source.channel)
 			}
-			// Several devices may report a channel (a console also lists the sources it backfeeds): a user wins over null
+			// Several devices may report a channel (a console also lists the sources it backfeeds): a user wins over
+			// null; between users, the device that owns the source wins, then the lowest IP. The answer does not
+			// depend on the order in which the devices were heard.
 			for (const [channel, user] of device.usage) {
-				if (user && !usage.has(channel)) usage.set(channel, user)
+				if (!user) continue
+				const claim: UsageClaim = { user, owns: owned.has(channel), ip: device.ip }
+				const best = claims.get(channel)
+				if (!best || claimBeats(claim, best)) claims.set(channel, claim)
 			}
 		}
 		list.sort(compareSources)
+		const usage = new Map<number, Readonly<SourceUser>>()
+		for (const [channel, claim] of claims) usage.set(channel, Object.freeze({ ...claim.user }))
 
-		const sourcesChanged = list.length !== this.list.length || list.some((s, i) => !sameSource(s, this.list[i]))
-		const usageChanged = !sameUsage(usage, this.usage)
-		if (sourcesChanged) this.list = list
-		if (usageChanged) this.usage = usage
-		if (sourcesChanged) this.emit('sources')
-		if (usageChanged) this.emit('usage')
+		if (list.length !== this.list.length || list.some((s, i) => !sameSource(s, this.list[i]))) {
+			this.list = list
+			this.sourcesDirty = true
+		}
+		if (!sameUsage(usage, this.usage)) {
+			this.usage = usage
+			this.usageDirty = true
+		}
+		this.flush()
+	}
+
+	/**
+	 * Emit `sources` then `usage` for what is dirty, until nothing is. A call from a listener (re-entrancy) returns
+	 * at once: the running flush announces what it added. Both events go out even if a listener throws; the first
+	 * error is rethrown at the end.
+	 */
+	private flush(): void {
+		if (this.flushing) return
+		this.flushing = true
+		let failure: { error: unknown } | undefined
+		const emit = (event: keyof DirectoryEvents): void => {
+			try {
+				this.emit(event)
+			} catch (error) {
+				failure ??= { error }
+			}
+		}
+		try {
+			while (this.sourcesDirty || this.usageDirty) {
+				if (this.sourcesDirty) {
+					this.sourcesDirty = false
+					emit('sources')
+				}
+				if (this.usageDirty) {
+					this.usageDirty = false
+					emit('usage')
+				}
+			}
+		} finally {
+			this.flushing = false
+		}
+		if (failure) throw failure.error
 	}
 }

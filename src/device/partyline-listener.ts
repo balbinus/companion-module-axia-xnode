@@ -23,9 +23,10 @@ export interface PartylineListenerEvents {
 	/** Bound and joined to the group */
 	listening: []
 	/**
-	 * Bind, membership or socket failure. Failing to bind or join releases the socket, so `start()` may be
-	 * called again to retry; a failure after `listening` leaves it open. Only emitted while someone listens
-	 * for it: without a listener the error is dropped instead of crashing the process.
+	 * Bind, membership or socket failure, or an exception thrown by an owner's `message` or `listening` handler.
+	 * Failing to bind or join releases the socket, so `start()` may be called again to retry; any other error
+	 * leaves it open. Only emitted while someone listens for it: without a listener the error is dropped instead
+	 * of crashing the process. Whatever an `error` handler throws is dropped too.
 	 */
 	error: [err: Error]
 }
@@ -68,7 +69,7 @@ export class PartylineListener extends EventEmitter<PartylineListenerEvents> {
 			if (current()) this.fail(socket, err)
 		})
 		socket.on('message', (buf: Buffer, rinfo: dgram.RemoteInfo) => {
-			if (current()) this.emit('message', buf, rinfo)
+			if (current()) this.guard(() => this.emit('message', buf, rinfo))
 		})
 		try {
 			socket.bind(this.port, () => {
@@ -81,7 +82,7 @@ export class PartylineListener extends EventEmitter<PartylineListenerEvents> {
 				}
 				this.joined = true
 				this.listening = true
-				this.emit('listening')
+				this.guard(() => this.emit('listening'))
 			})
 		} catch (e) {
 			this.fail(socket, e)
@@ -91,8 +92,11 @@ export class PartylineListener extends EventEmitter<PartylineListenerEvents> {
 	/** Leave the group and close the socket. Idempotent; resolves once closed. No events are emitted afterwards. */
 	async stop(): Promise<void> {
 		const socket = this.socket
+		const joined = this.joined
 		this.socket = null
-		if (socket) this.release(socket, this.joined)
+		this.joined = false
+		this.listening = false
+		if (socket) this.release(socket, joined)
 		return this.closing
 	}
 
@@ -105,9 +109,22 @@ export class PartylineListener extends EventEmitter<PartylineListenerEvents> {
 		this.report(e)
 	}
 
+	/** Run an owner's handler: its exception is reported as `error` instead of escaping into the socket's dispatch */
+	private guard(emit: () => void): void {
+		try {
+			emit()
+		} catch (e) {
+			this.report(e)
+		}
+	}
+
 	private report(e: unknown): void {
-		const err = e instanceof Error ? e : new Error(String(e))
-		if (this.listenerCount('error') > 0) this.emit('error', err)
+		if (this.listenerCount('error') === 0) return
+		try {
+			this.emit('error', e instanceof Error ? e : new Error(String(e)))
+		} catch {
+			// a throwing `error` handler has nobody left to tell, and must not recurse into report()
+		}
 	}
 
 	/** Best-effort leave + close. The socket keeps its (silenced) error handler while closing. */
