@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { UpdateActions } from '../src/actions.js'
 import { UpdateFeedbacks } from '../src/feedbacks.js'
-import { UpdatePresets } from '../src/presets.js'
+import { MAX_DISCOVERED_ROUTES, UpdatePresets } from '../src/presets.js'
 import { computeVariableDefinitions } from '../src/model/derived.js'
 import type ModuleInstance from '../src/main.js'
 import { loadedState, type FixtureName } from './fixtures/load.js'
+import { networkDirectory } from './helpers/directory.js'
+import { LivewireDirectory } from '../src/model/directory.js'
+
+type Any = any
 
 interface Fake {
 	self: ModuleInstance
@@ -16,7 +20,7 @@ interface Fake {
 	presets: Record<string, Any>
 }
 
-function build(fixture: FixtureName, cfg: Any = {}): Fake {
+function build(fixture: FixtureName, cfg: Any = {}, directory?: LivewireDirectory): Fake {
 	const state = loadedState(fixture)
 	const config = {
 		knownSources: '22301=Studio Mic 1\n239.192.87.29=Other',
@@ -30,6 +34,7 @@ function build(fixture: FixtureName, cfg: Any = {}): Fake {
 		label: 'xn',
 		controller: { state, levelsReady: true },
 		config,
+		directory,
 		log() {},
 		setActionDefinitions(d: Any) {
 			fake.actions = d
@@ -110,7 +115,7 @@ function problems(f: Fake): string[] {
 	return errs
 }
 
-const CASES: Array<[string, FixtureName, Any]> = [
+const CASES: Array<[string, FixtureName, Any, LivewireDirectory?]> = [
 	['xNode2 combo', 'xnode2-combo', {}],
 	['legacy analog 4x4 (a)', 'legacy-analog4x4-a', {}],
 	['legacy analog 4x4 (b)', 'legacy-analog4x4-b', {}],
@@ -123,12 +128,13 @@ const CASES: Array<[string, FixtureName, Any]> = [
 			knownSources: '',
 		},
 	],
+	['xNode2 with discovered sources', 'xnode2-combo', {}, networkDirectory()],
 ]
 
 describe('presets reference real actions, feedbacks and variables', () => {
-	for (const [name, fixture, cfg] of CASES) {
+	for (const [name, fixture, cfg, directory] of CASES) {
 		it(name, () => {
-			const f = build(fixture, cfg)
+			const f = build(fixture, cfg, directory)
 			expect(Object.keys(f.presets).length).toBeGreaterThan(0)
 			expect(problems(f)).toEqual([])
 		})
@@ -160,6 +166,67 @@ describe('nothing is generated for missing features', () => {
 		const f = build('xnode2-combo')
 		const all = f.sections.flatMap((s) => s.definitions.flatMap((g: Any) => g.presets as string[]))
 		expect(new Set(all).size).toBe(all.length)
+	})
+})
+
+describe('DST routing presets', () => {
+	const routes = (f: Fake, n: number): Any[] =>
+		f.sections
+			.find((s) => s.id === 'dst_routing')
+			.definitions.find((g: Any) => g.id === `route_${n}`)
+			.presets.map((id: string) => ({ id, ...f.presets[id] }))
+
+	it('lists the known sources, then the discovered ones not already known, by channel', () => {
+		// 239.192.87.29 is both known ("Other") and discovered (MIC 1 on .223): it is offered once, as known
+		const f = build('xnode2-combo', {}, networkDirectory())
+		const ids = routes(f, 1).map((p) => p.id)
+		expect(ids.slice(0, 2)).toEqual(['route_1_0', 'route_1_1'])
+		expect(ids).not.toContain('route_1_lw_239_192_87_29')
+		expect(ids).toContain('route_1_lw_239_192_87_30')
+		expect(ids).toContain('route_1_lw_239_193_87_29')
+		expect(ids.at(-1)).toBe('route_1_off')
+		const src2 = routes(f, 1).find((p) => p.id === 'route_1_lw_239_192_87_30')
+		expect(src2.name).toBe('DST 1 ← SRC 2 (Node-223-0)')
+		expect(src2.steps[0].down[0]).toEqual({
+			actionId: 'dst_connect_channel',
+			options: { dst: 1, source: '239.192.87.30', channel: 22302, kind: 'from' },
+		})
+		expect(src2.feedbacks[0].options).toMatchObject({ dst: 1, target: 'known', known: '239.192.87.30' })
+	})
+
+	it('keeps the known-source preset ids, so existing presets keep their identity', () => {
+		const without = build('xnode2-combo')
+		const withDir = build('xnode2-combo', {}, networkDirectory())
+		const known = (f: Fake): string[] =>
+			routes(f, 1)
+				.map((p) => p.id)
+				.filter((id: string) => /^route_1_\d+$/.test(id))
+		expect(known(withDir)).toEqual(known(without))
+	})
+
+	it(`offers at most ${MAX_DISCOVERED_ROUTES} discovered sources per destination`, () => {
+		const directory = new LivewireDirectory({ now: () => 0 })
+		const sources = Array.from({ length: MAX_DISCOVERED_ROUTES + 10 }, (_, i) => ({
+			slot: `S${String(i + 1).padStart(3, '0')}`,
+			channel: 1000 + i,
+			name: `Src ${i}`,
+			streamAddress: `239.192.3.${i}`,
+			backfeedAddress: `239.193.3.${i}`,
+		}))
+		directory.ingest({
+			kind: 'full',
+			deviceIp: '10.0.0.1',
+			configVersion: 1,
+			sourceCount: sources.length,
+			deviceName: 'Big',
+			sources,
+			usage: [],
+		})
+		const f = build('xnode2-combo', { knownSources: '' }, directory)
+		const ids = routes(f, 1).map((p) => p.id)
+		expect(ids).toHaveLength(MAX_DISCOVERED_ROUTES + 1)
+		expect(ids[0]).toBe('route_1_lw_239_192_3_0')
+		expect(problems(f)).toEqual([])
 	})
 })
 

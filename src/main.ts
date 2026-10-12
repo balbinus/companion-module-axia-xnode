@@ -189,12 +189,14 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		const live = (): boolean => this.running && !this.destroying && this.discovery === discovery
 		discovery.on('sources', () => {
 			if (!live()) return
-			// The variable definitions and presets do not depend on the sources; the dropdowns only if their choices changed
+			// The variable definitions do not depend on the sources; the dropdowns and routing presets only if the
+			// source choices changed
 			const rendered = this.renderSourceChoices()
 			if (rendered !== this.renderedSources) {
 				this.renderedSources = rendered
 				this.updateActions()
 				this.updateFeedbacks()
+				this.updatePresets()
 			}
 			UpdateVariableValues(this, 'all')
 		})

@@ -189,7 +189,7 @@ describe('start', () => {
 })
 
 describe('events', () => {
-	it('sources: rebuilds the actions and feedbacks and refreshes the values, not presets or variable definitions', async () => {
+	it('sources: rebuilds the actions, feedbacks and presets and refreshes the values, not the variable definitions', async () => {
 		const r = await start()
 		const discovery = lastDiscovery()
 		const before = calls(r)
@@ -199,7 +199,7 @@ describe('events', () => {
 		const after = calls(r)
 		expect(after.actions).toBe(before.actions + 1)
 		expect(after.feedbacks).toBe(before.feedbacks + 1)
-		expect(after.presets).toBe(before.presets)
+		expect(after.presets).toBe(before.presets + 1)
 		expect(after.variables).toBe(before.variables)
 		expect(after.values).toBe(before.values + 1)
 
@@ -241,6 +241,7 @@ describe('events', () => {
 		const after = calls(r)
 		expect(after.actions).toBe(before.actions)
 		expect(after.feedbacks).toBe(before.feedbacks)
+		expect(after.presets).toBe(before.presets)
 		expect(sourceDropdown(r)).toBe(choices)
 		// but the values follow
 		expect(r.context.setVariableValues.mock.calls.at(-1)?.[0]).toMatchObject({ dst_2_source_name: 'To: TEST 2' })
@@ -280,6 +281,7 @@ describe('events', () => {
 		discovery.emit('sources') // the dropdowns already show it
 		expect(calls(r).actions).toBe(before.actions)
 		expect(calls(r).feedbacks).toBe(before.feedbacks)
+		expect(calls(r).presets).toBe(before.presets)
 	})
 
 	it('usage: refreshes the values and checks src_in_use, nothing else', async () => {
@@ -293,6 +295,7 @@ describe('events', () => {
 		const after = calls(r)
 		expect(after.actions).toBe(before.actions)
 		expect(after.feedbacks).toBe(before.feedbacks)
+		expect(after.presets).toBe(before.presets)
 		expect(after.values).toBe(before.values + 1)
 		expect(r.context.setVariableValues.mock.calls.at(-1)?.[0]).toEqual({ src_1_used_by: '10.96.30.235/11' })
 		expect(r.context.checkFeedbacks).toHaveBeenCalledTimes(1)

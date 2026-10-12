@@ -304,14 +304,56 @@ function addGains(b: PresetBuilder, self: ModuleInstance, state: XNodeState): vo
 
 // ------------------------------------------------------------------ DST routing
 
-function addRouting(b: PresetBuilder, self: ModuleInstance, state: XNodeState): void {
+/** Discovered sources per destination at most: presets multiply by the DST count */
+export const MAX_DISCOVERED_ROUTES = 64
+
+interface RouteSource {
+	/** Preset id suffix: the list index for known sources (as before), the address for discovered ones (stable) */
+	key: string
+	ip: string
+	label: string
+	/** Preset name; adds the device for discovered sources */
+	name: string
+	channel?: number
+}
+
+/** The known sources (module config), then the discovered ones not already listed, by channel */
+function routeSources(self: ModuleInstance): RouteSource[] {
 	const known = parseKnownSources(self.config.knownSources ?? '')
+	const out: RouteSource[] = known.map((k, idx) => ({
+		key: String(idx),
+		ip: k.ip,
+		label: k.label,
+		name: k.label,
+		channel: k.channel,
+	}))
+	const seen = new Set(known.map((k) => k.ip))
+	let discovered = 0
+	for (const s of self.directory?.sources() ?? []) {
+		if (discovered >= MAX_DISCOVERED_ROUTES) break
+		if (!s.streamAddress || seen.has(s.streamAddress)) continue
+		seen.add(s.streamAddress)
+		discovered++
+		const label = s.name || String(s.channel)
+		out.push({
+			key: `lw_${s.streamAddress.replaceAll('.', '_')}`,
+			ip: s.streamAddress,
+			label,
+			name: `${label} (${s.deviceName})`,
+			channel: s.channel,
+		})
+	}
+	return out
+}
+
+function addRouting(b: PresetBuilder, self: ModuleInstance, state: XNodeState): void {
+	const sources = routeSources(self)
 	const groups = Array.from({ length: state.ndst }, (_, i) => i + 1).map((n) => {
-		const ids = known.map((k, idx) =>
+		const ids = sources.map((k) =>
 			b.add(
-				`route_${n}_${idx}`,
+				`route_${n}_${k.key}`,
 				pressButton(
-					`DST ${n} ← ${k.label}`,
+					`DST ${n} ← ${k.name}`,
 					style(`${k.label}\\n→ DST ${n}`),
 					[
 						{
@@ -344,13 +386,14 @@ function addRouting(b: PresetBuilder, self: ModuleInstance, state: XNodeState): 
 			`route_${n}`,
 			`DST ${n} routing`,
 			ids,
-			'Green: connected to this source (from the "Known Livewire sources" list). The last button disconnects; green while disconnected.',
+			'Green: connected to this source (known sources first, then discovered ones). The last button disconnects; green while disconnected.',
 		)
 	})
 	b.section(
 		'dst_routing',
 		'DST routing',
-		'Connect each destination to a known source. Needs "Allow mixer & routing changes" and entries in "Known Livewire sources".',
+		'Connect each destination to a known source (module config) or a source discovered on the network ' +
+			`(up to ${MAX_DISCOVERED_ROUTES}, by channel). Needs "Allow mixer & routing changes".`,
 		groups,
 	)
 }
