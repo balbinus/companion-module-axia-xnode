@@ -9,6 +9,8 @@ import {
 import { XNodeController, type ControllerStatus, type LogFn } from './device/controller.js'
 import { SourceDiscovery } from './device/discovery.js'
 import { XNodeOperations } from './device/operations.js'
+import { sourceChoices } from './choices.js'
+import { parseKnownSources } from './lwrp/livewire.js'
 import type { LivewireDirectory } from './model/directory.js'
 import type { StateChange } from './model/state.js'
 import { UpdateVariableDefinitions, UpdateVariableValues, type VariablesSchema } from './variables.js'
@@ -41,6 +43,21 @@ export class SerialQueue {
 const FLUSH_DEBOUNCE_MS = 100
 const REBUILD_DEBOUNCE_MS = 300
 
+/** Where the discovery listens: its interface IP ('' = system default) and the configured value if it was unusable */
+interface DiscoveryTarget {
+	interfaceIp: string
+	invalid?: string
+}
+
+/** What the config asks of the discovery; undefined when it is off. Two equal targets need the same discovery. */
+function discoveryTarget(
+	config: Pick<ModuleConfig, 'discoverSources' | 'partylineInterface'>,
+): DiscoveryTarget | undefined {
+	if (config.discoverSources === false) return undefined
+	const configured = (config.partylineInterface ?? '').trim()
+	return isValidInterfaceIp(configured) ? { interfaceIp: configured } : { interfaceIp: '', invalid: configured }
+}
+
 const STATUS_MAP: Record<ControllerStatus, InstanceStatus> = {
 	connecting: InstanceStatus.Connecting,
 	ok: InstanceStatus.Ok,
@@ -53,8 +70,13 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	config!: ModuleConfig // Setup in init()
 	controller!: XNodeController
 	ops!: XNodeOperations
-	/** Livewire source discovery; absent while it is off in the config or no device is running */
+	/** Livewire source discovery; absent while it is off in the config. Outlives device restarts. */
 	discovery: SourceDiscovery | undefined
+
+	/** The interface IP the running discovery was started with */
+	private discoveryInterface: string | undefined
+	/** The source dropdown choices (ids and labels) the action and feedback definitions were last built with */
+	private renderedSources = ''
 
 	private readonly lifecycle = new SerialQueue()
 	/** Set synchronously by destroy(): queued init/configUpdated work then does nothing */
@@ -79,6 +101,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		await this.lifecycle.run(async () => {
 			if (this.destroying) return
 			this.startDevice()
+			await this.syncDiscovery(discoveryTarget(this.config))
 			this.rebuildDefinitions()
 		})
 	}
@@ -87,15 +110,27 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	async destroy(): Promise<void> {
 		this.log('debug', 'destroy')
 		this.destroying = true
-		await this.lifecycle.run(async () => this.stopDevice())
+		await this.lifecycle.run(async () => {
+			try {
+				await this.stopDevice()
+			} finally {
+				await this.stopDiscovery()
+			}
+		})
 	}
 
 	async configUpdated(config: StoredConfig, secrets: ModuleSecrets | undefined): Promise<void> {
 		await this.lifecycle.run(async () => {
 			if (this.destroying) return
-			await this.stopDevice()
+			const next: ModuleConfig = { ...config, password: secrets?.password ?? '' }
+			try {
+				await this.stopDevice()
+			} finally {
+				// The discovery (and its directory, which takes minutes to fill) only restarts when its settings change
+				await this.syncDiscovery(discoveryTarget(next))
+			}
 			if (this.destroying) return // destroy() arrived while stopping: it wins
-			this.config = { ...config, password: secrets?.password ?? '' }
+			this.config = next
 			this.startDevice()
 			this.rebuildDefinitions()
 		})
@@ -133,23 +168,34 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		controller.on('change', (change) => this.queueChange(change))
 		this.running = true
 		controller.start()
-		this.startDiscovery(log)
 	}
 
-	private startDiscovery(log: LogFn): void {
-		if (this.config.discoverSources === false) return
-		let interfaceIp = (this.config.partylineInterface ?? '').trim()
-		if (!isValidInterfaceIp(interfaceIp)) {
-			log('warn', `Invalid Livewire network interface "${interfaceIp}": using the system default`)
-			interfaceIp = ''
+	/** Make the discovery match the target: keep the running one if it already does, else replace it */
+	private async syncDiscovery(target: DiscoveryTarget | undefined): Promise<void> {
+		if (this.destroying) target = undefined
+		if (this.discovery && target?.interfaceIp === this.discoveryInterface) return
+		await this.stopDiscovery()
+		this.startDiscovery(target)
+	}
+
+	private startDiscovery(target: DiscoveryTarget | undefined): void {
+		if (!target) return
+		const log: LogFn = (level, msg) => this.log(level, msg)
+		if (target.invalid !== undefined) {
+			log('warn', `Invalid Livewire network interface "${target.invalid}": using the system default`)
 		}
-		const discovery = new SourceDiscovery({ interfaceIp, log })
+		const discovery = new SourceDiscovery({ interfaceIp: target.interfaceIp, log })
+		// Read lazily: the discovery outlives the device, which may be stopped or restarting when an event comes
 		const live = (): boolean => this.running && !this.destroying && this.discovery === discovery
 		discovery.on('sources', () => {
 			if (!live()) return
-			// New dropdown choices and source names; the variable definitions and presets do not depend on them
-			this.updateActions()
-			this.updateFeedbacks()
+			// The variable definitions and presets do not depend on the sources; the dropdowns only if their choices changed
+			const rendered = this.renderSourceChoices()
+			if (rendered !== this.renderedSources) {
+				this.renderedSources = rendered
+				this.updateActions()
+				this.updateFeedbacks()
+			}
 			UpdateVariableValues(this, 'all')
 		})
 		discovery.on('usage', () => {
@@ -158,25 +204,43 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.checkFeedbacks('src_in_use')
 		})
 		this.discovery = discovery
+		this.discoveryInterface = target.interfaceIp
 		discovery.start()
+	}
+
+	private async stopDiscovery(): Promise<void> {
+		const discovery = this.discovery
+		this.discovery = undefined
+		this.discoveryInterface = undefined
+		try {
+			await discovery?.stop()
+		} catch (e) {
+			this.log('warn', `Discovery shutdown: ${e instanceof Error ? e.message : String(e)}`)
+		}
+	}
+
+	/** The source dropdown choices as the definitions are built from the known sources and the directory now */
+	private renderSourceChoices(): string {
+		return JSON.stringify(sourceChoices(parseKnownSources(this.config.knownSources ?? ''), this.directory))
 	}
 
 	private async stopDevice(): Promise<void> {
 		this.running = false
-		clearTimeout(this.flushTimer)
-		clearTimeout(this.rebuildTimer)
-		this.flushTimer = this.rebuildTimer = undefined
-		this.pending = []
-		const discovery = this.discovery
-		this.discovery = undefined
+		this.clearTimers()
 		// Let the operations restore running GPO pulses while the connection is still open (bounded).
 		try {
 			await this.ops?.destroy()
 		} catch (e) {
 			this.log('warn', `Shutdown: ${e instanceof Error ? e.message : String(e)}`)
 		}
-		this.controller?.destroy()
-		await discovery?.stop()
+		try {
+			this.controller?.destroy()
+		} finally {
+			this.clearTimers()
+		}
+	}
+
+	private clearTimers(): void {
 		clearTimeout(this.flushTimer)
 		clearTimeout(this.rebuildTimer)
 		this.flushTimer = this.rebuildTimer = undefined
@@ -206,6 +270,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	private rebuildDefinitions(): void {
 		this.rebuildTimer = undefined
 		if (this.destroying) return
+		this.renderedSources = this.renderSourceChoices()
 		this.updateActions()
 		this.updateFeedbacks()
 		this.updateVariableDefinitions()

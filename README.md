@@ -25,7 +25,8 @@ Companion API: `@companion-module/base` 2.x (typed `InstanceBase`).
 
 ```
 src/
-  main.ts          Companion glue: config, status, wiring of controller events to definitions
+  main.ts          Companion glue: config, status, wiring of controller events to definitions; the source discovery outlives
+                   device restarts (config saves) and restarts only when its own settings change
   config.ts        config fields and ModuleConfig
   actions.ts       action definitions -> device/operations
   feedbacks.ts     feedback definitions (evaluation in model/derived)
