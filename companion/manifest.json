@@ -5,7 +5,7 @@
 	"name": "Axia xNode",
 	"shortname": "Axia xNode",
 	"description": "Monitor and control Axia xNode / xNode2 audio nodes over LWRP: mixer, routing, gains, levels, GPIO",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"license": "MIT",
 	"repository": "git+https://github.com/balbinus/companion-module-axia-xnode.git",
 	"bugs": "https://github.com/balbinus/companion-module-axia-xnode/issues",

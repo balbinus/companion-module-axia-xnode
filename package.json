@@ -1,6 +1,6 @@
 {
 	"name": "companion-module-axia-xnode",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"description": "Bitfocus Companion module to monitor and control Axia xNode and xNode2 audio nodes over LWRP",
 	"main": "dist/main.js",
 	"type": "module",
