@@ -32,9 +32,10 @@ src/
   variables.ts     variable definitions and values
   presets.ts       presets generated from the detected model
   choices.ts       dropdown choices and crosspoint pickers
-  lwrp/            protocol: line parser/formatter, Livewire addresses, dB <-> tenths
-  model/           state (single merge path for every line), I/O map, derived values
-  device/          TCP connection, controller (sync, subscriptions, heartbeat), operations (validated writes), HTTP meters
+  lwrp/            protocol: line parser/formatter, Livewire addresses, dB <-> tenths, partyline decoder (cmsg2, partyline)
+  model/           state (single merge path for every line), I/O map, derived values, Livewire source directory (directory)
+  device/          TCP connection, controller (sync, subscriptions, heartbeat), operations (validated writes), HTTP meters,
+                   partyline-listener (receive-only multicast socket), discovery (listener + decoder + directory)
 companion/         manifest.json and HELP.md
 test/              vitest tests and fixtures
 ```
@@ -58,5 +59,16 @@ Everything outside `main.ts` and the definition builders is independent of `Inst
   ```
 
   Live tests must never write `SET`, `IP`, `MIXCFG`, input source or phantom power, and never query `INP` on legacy nodes. Use test devices, not production nodes.
+
+- **Source discovery live test** (`test/live/partyline.test.ts`): skipped unless `PARTYLINE_LIVE=1`. It only listens to the Livewire partyline (multicast `239.192.255.3:4001`); nothing is sent. Keepalives come every 10 to 20 seconds and full adverts about every 150 seconds, so it can take up to about 4 minutes. The network must have at least one device that advertises a source.
+
+  | Variable          | Meaning                                                                            |
+  | ----------------- | ---------------------------------------------------------------------------------- |
+  | `PARTYLINE_LIVE`  | `1` to run the test                                                                |
+  | `PARTYLINE_IFACE` | optional: IP of the local network interface to join the group on (default: system) |
+
+  ```sh
+  PARTYLINE_LIVE=1 PARTYLINE_IFACE=<ip> yarn vitest run test/live/partyline.test.ts
+  ```
 
 Tests encode the intended behaviour; a known bug is kept as `it.fails(...)` with a `// BUG:` comment.

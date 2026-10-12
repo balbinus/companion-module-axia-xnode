@@ -30,13 +30,26 @@ The model is detected when the module connects (from the `VER` answer). Actions,
 | Expose crosspoint variables       | One variable per crosspoint (up to 600). Off by default.                                                                                                                                                                             |
 | Crosspoint gain minimum / maximum | The node does not limit crosspoint gains, so the module does (default -80 to +24 dB).                                                                                                                                                |
 | Known Livewire sources            | Optional, one per line: `22301=Studio Mic 1` (channel number) or `239.192.87.29=Name` (multicast address). `#` starts a comment. Used by the destination connect dropdowns, the "connected to" feedback and the DST routing presets. |
+| Discover Livewire sources         | On by default. Listens to the Livewire source advertisements (multicast `239.192.255.3`, UDP `4001`) to name sources. Receive-only. See "Source discovery" below.                                                                    |
+| Livewire network interface IP     | Optional, shown when discovery is on. IP of the network interface connected to the Livewire network. Empty: the system default.                                                                                                      |
+
+### Source discovery
+
+Every instance (one per node) listens to the Livewire "partyline", where each device announces its sources (channel, name, multicast addresses) and where the consoles' engines report which sources they use. The module builds a directory of the sources on the network from it. It is used for the source dropdowns of the actions and feedbacks, for the `dst_N_source_name` and `src_N_used_by` variables and for the "Source: in use by a console" feedback.
+
+- Receive-only: the module joins the multicast group and listens. Nothing is ever sent, and it needs no password.
+- Companion must be able to receive that multicast traffic: the machine has to be on the Livewire network (or on a network that carries it), and a firewall must allow incoming UDP multicast on port 4001. With several network interfaces, enter the one connected to Livewire in "Livewire network interface IP".
+- Running Companion in Docker: use host networking (`--network host`), as multicast does not reach a container on a bridge network.
+- Names are not instant. Devices announce a "keepalive" every 10 to 20 seconds and their whole list of sources about every 150 seconds, so the sources of a device can take up to about 160 seconds to appear after the module starts. A renamed source is announced by its device at once. A device that is silent for a minute is forgotten.
+- Discovery never changes the status of the connection to the node. If it cannot start (no such interface, no multicast), a warning is written to the module log and it tries again every 30 seconds.
+- Switch it off in the configuration if the network blocks multicast or you do not want it: the module then only knows the "Known Livewire sources".
 
 ## Actions
 
 Crosspoint pickers choose either a **stereo pair** (left to left, right to right) or a **single mono channel**.
 
 - **Mixer**: set, clear, toggle, adjust (rotary friendly), exclusive select (only this input feeds the output), clear output, store/recall snapshot (the store action returns the snapshot as text, put it in a custom variable).
-- **Destinations**: connect to a known source or Livewire channel, connect to a multicast address, disconnect, set/adjust output gain.
+- **Destinations**: connect to a known or discovered source (the dropdown lists the "Known Livewire sources" first, then the sources heard on the network) or to a Livewire channel, connect to a multicast address, disconnect, set/adjust output gain.
 - **Sources**: set/adjust input gain, enable/disable/toggle stream, set address, set mode (Live / Standard / AES67), rename (16 characters max).
 - **GPO**: set pins, pulse pins, toggle pins. A pulse drives the pins, then restores the level they had before it. The restore is always scheduled once the pulse was sent, retried for about 3 minutes if the link is down, and done immediately when the module is disabled or its configuration is saved. Pulsing a pin that already has the pulse level (and no pulse running) changes nothing; pulsing a pin whose pulse is running restarts the timer.
 - Repeated set actions on the same target (set, toggle, exclusive, gain set) that are still waiting in the queue are merged into the latest one. A failed action is reported as failed in Companion and logged.
@@ -46,15 +59,18 @@ Action ids: `mix_set`, `mix_clear`, `mix_toggle`, `mix_adjust`, `mix_exclusive`,
 
 ## Feedbacks
 
-Crosspoint active (optionally by gain), output fed only by an input, destination connected to a source, destination connected (any), source stream enabled, level state (signal present / silence / clipping for SRC, DST and, on xNode2, physical inputs and outputs), mixer in factory mode, crosspoint budget nearly full, GPI pin active, GPO pin active, microphone phantom power on.
+Crosspoint active (optionally by gain), output fed only by an input, destination connected to a source (known or discovered), destination connected (any), source stream enabled, source in use by a console (see below), level state (signal present / silence / clipping for SRC, DST and, on xNode2, physical inputs and outputs), mixer in factory mode, crosspoint budget nearly full, GPI pin active, GPO pin active, microphone phantom power on.
+
+**Source: in use by a console** (`src_in_use`) is true when a console engine owns the SRC. A source "belongs" to one engine, which then generates its backfeed and its source GPIO, even if the audio is used in many places. The state comes from the Livewire adverts, so it needs "Discover Livewire sources". Optionally give the IP of a console engine to test for that engine only (empty = any). It is false when discovery is off or nothing is known yet.
 
 ## Variables
 
 Replace `N` by the number; only what exists on the detected model is defined.
 
 - Device: `model`, `devn`, `product`, `firmware`, `lwrp_version`, `hostname`, `ip`, `link`, `node_id`, `mixer_mode`, `xpoints_used`, and on legacy nodes `set_nid`, `set_lwclk_prio`, `set_ptp_dom`, `set_enable_sap`, `set_adip`.
-- Sources: `src_N_name`, `src_N_enabled`, `src_N_address`, `src_N_channel`, `src_N_mode`, `src_N_gain`, `src_N_signal`.
-- Destinations: `dst_N_name`, `dst_N_address`, `dst_N_channel`, `dst_N_source_label`, `dst_N_gain`, `dst_N_signal`.
+- Sources: `src_N_name`, `src_N_enabled`, `src_N_address`, `src_N_channel`, `src_N_used_by`, `src_N_mode`, `src_N_gain`, `src_N_signal`.
+- Destinations: `dst_N_name`, `dst_N_address`, `dst_N_channel`, `dst_N_source_label`, `dst_N_source_name`, `dst_N_gain`, `dst_N_signal`.
+- `dst_N_source_name` and `src_N_used_by` come from the Livewire adverts and are empty when discovery is off or the answer is not known yet. `dst_N_source_name` is the name of the source the DST listens to, with `To: ` in front when it listens to the backfeed of a source (for example `To: MIC 1`). `src_N_used_by` is the console using the SRC as `engine IP/fader`, for example `10.96.30.235/11`.
 - Mixer: `mix_out_K_inputs` (what feeds output K), `xp_O_I` (crosspoint gain, optional).
 - Physical I/O (xNode2): `hwi_N_signal`, `hwo_N_signal`. Inputs (xNode2): `inp_N_name` and `inp_N_type` exist for every INP, `inp_N_gain` and `inp_N_phantom` only for microphone inputs.
 - Meters (when enabled): `src_N_peak_l|r`, `dst_N_peak_l|r`, `hwi_N_peak_l|r`, `hwo_N_peak_l|r`.
@@ -89,4 +105,6 @@ Buttons that write need the matching permission in the configuration, otherwise 
 - Meters and level alerts have not been verified with real audio. The first level state after connecting is provisional (about 3 seconds) and is ignored.
 - On legacy xNodes, physical input/output (HWI/HWO) meters are only available with the "HTTP stream" meter mode.
 - GPIO and xSelector nodes are only partially supported (read-only / limited).
-- Livewire sources cannot be discovered on the network; list the ones you need in "Known Livewire sources".
+- Source discovery depends on the multicast partyline reaching the machine that runs Companion (see "Source discovery"). Where it does not, list the sources you need in "Known Livewire sources".
+- Discovered names are as the devices announce them (the nodes cut source names at 16 characters).
+- "In use by a console" is what the devices report: the engine that owns the source, and its fader. It does not tell whether the fader is open or the source is on air.
