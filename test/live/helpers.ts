@@ -31,6 +31,8 @@ export const READ_ONLY: ModuleConfig = {
 	xpointMaxDb: 24,
 	exposeXpointVariables: false,
 	knownSources: '',
+	discoverSources: false,
+	partylineInterface: '',
 }
 
 /** Every write toggle on except "leave factory mode", which the live tests never use. */

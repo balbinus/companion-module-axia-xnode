@@ -1,4 +1,5 @@
 import { Regex, type SomeCompanionConfigField } from '@companion-module/base'
+import { isIpv4 } from './lwrp/livewire.js'
 
 export type MeterMode = 'off' | 'poll' | 'http'
 
@@ -26,14 +27,26 @@ export type ModuleConfig = {
 	xpointMaxDb: number
 	exposeXpointVariables: boolean
 	knownSources: string
+	/** Listen to the Livewire partyline to name sources. Treated as on unless explicitly false. */
+	discoverSources: boolean
+	/** Local interface IP for the partyline multicast group; '' = system default */
+	partylineInterface: string
 }
 
 export const DEFAULT_PORT = 93
+
+/** Regex.IP that also accepts an empty value */
+const OPTIONAL_IP_REGEX = `/^$|${Regex.IP.slice(1)}`
 
 const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/
 
 export function isValidHost(host: unknown): host is string {
 	return typeof host === 'string' && host.length <= 253 && HOST_RE.test(host.trim())
+}
+
+/** The partyline interface option: empty (system default) or an IPv4 address */
+export function isValidInterfaceIp(value: unknown): value is string {
+	return typeof value === 'string' && (value.trim() === '' || isIpv4(value.trim()))
 }
 
 export function isValidPort(port: unknown): port is number {
@@ -186,6 +199,25 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			width: 12,
 			multiline: true,
 			default: '',
+		},
+		{
+			type: 'checkbox',
+			id: 'discoverSources',
+			label: 'Discover Livewire sources',
+			tooltip:
+				'Listens to the Livewire source advertisements (multicast 239.192.255.3, UDP 4001) to name sources. Receive-only: nothing is sent. In Docker, Companion needs host networking.',
+			width: 6,
+			default: true,
+		},
+		{
+			type: 'textinput',
+			id: 'partylineInterface',
+			label: 'Livewire network interface IP (optional)',
+			tooltip: 'Local IP address of the network interface connected to the Livewire network. Blank = system default.',
+			width: 6,
+			regex: OPTIONAL_IP_REGEX,
+			default: '',
+			isVisibleExpression: '$(options:discoverSources)',
 		},
 	]
 }

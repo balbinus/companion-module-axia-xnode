@@ -69,6 +69,8 @@ const baseConfig: ModuleConfig = {
 	xpointMaxDb: 24,
 	exposeXpointVariables: false,
 	knownSources: '',
+	discoverSources: false,
+	partylineInterface: '',
 }
 
 interface Rig {
