@@ -3,6 +3,8 @@
  * See _research/partyline/CMsg2-erratum.md (not in the repository) for the reverse-engineered format.
  */
 
+import { leafBigInt, leafMessage, leafNumber, leafString, parseCMsg2, type CMsg2Message } from './cmsg2.js'
+
 export const PARTYLINE_GROUP = '239.192.255.3'
 export const PARTYLINE_PORT = 4001
 
@@ -53,7 +55,96 @@ export interface PartylineAdvert {
 	usage: SourceUsage[]
 }
 
+const SLOT_RE = /^S\d{3}$/
+
+/** u32 to dotted quad */
+function dottedQuad(n: number): string {
+	return `${n >>> 24}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`
+}
+
+function kindOf(advt: number | undefined): AdvertKind | undefined {
+	switch (advt) {
+		case 1:
+			return 'full'
+		case 2:
+			return 'keepalive'
+		case 3:
+			return 'usage'
+		default:
+			return undefined
+	}
+}
+
+/** The `Snnn` leaves that hold a nested message, in packet order */
+function* slots(msg: CMsg2Message): Generator<[string, CMsg2Message]> {
+	for (const leaf of msg.leaves) {
+		if (SLOT_RE.test(leaf.name) && typeof leaf.value === 'object') yield [leaf.name, leaf.value]
+	}
+}
+
+/** A missing address stays '' rather than dropping the source: name and channel are still useful */
+function addressOf(src: CMsg2Message, key: string): string {
+	const n = leafNumber(src, key)
+	return n === undefined ? '' : dottedQuad(n)
+}
+
+function decodeSources(msg: CMsg2Message): AdvertisedSource[] {
+	const out: AdvertisedSource[] = []
+	for (const [slot, src] of slots(msg)) {
+		const channel = leafNumber(src, 'PSID')
+		if (channel === undefined) continue
+		out.push({
+			slot,
+			channel,
+			name: (leafString(src, 'PSNM') ?? '').trim(),
+			streamAddress: addressOf(src, 'FSID'),
+			backfeedAddress: addressOf(src, 'BSID'),
+		})
+	}
+	return out
+}
+
+/** BUSY bytes b0..b7: b2-3 = engine IP low half, b4-5 = fader (0-based), b6-7 = engine IP high half, b0-1 unknown. 0 = unused. */
+function decodeBusy(busy: bigint): SourceUser | null {
+	if (busy === 0n) return null
+	const b = Buffer.alloc(8)
+	b.writeBigUInt64BE(busy)
+	return { engineIp: `${b[6]}.${b[7]}.${b[2]}.${b[3]}`, fader: b.readUInt16BE(4) + 1 }
+}
+
+function decodeUsage(msg: CMsg2Message): SourceUsage[] {
+	const out: SourceUsage[] = []
+	for (const [, src] of slots(msg)) {
+		const channel = leafNumber(src, 'PSID')
+		const busy = leafBigInt(src, 'BUSY')
+		if (channel === undefined || busy === undefined) continue
+		out.push({ channel, usedBy: decodeBusy(busy) })
+	}
+	return out
+}
+
 /** Decode one partyline datagram. Returns null for anything that is not a well-formed advert. */
-export function decodeAdvert(_buf: Buffer, _senderIp: string): PartylineAdvert | null {
-	throw new Error('decodeAdvert: not implemented yet')
+export function decodeAdvert(buf: Buffer, senderIp: string): PartylineAdvert | null {
+	const msg = parseCMsg2(buf)?.message
+	if (msg?.name !== 'NEST') return null
+	const kind = kindOf(leafNumber(msg, 'ADVT'))
+	const term = leafMessage(msg, 'TERM')
+	if (kind === undefined || term === undefined) return null
+
+	const inip = leafNumber(term, 'INIP')
+	const advert: PartylineAdvert = {
+		kind,
+		deviceIp: inip ? dottedQuad(inip) : senderIp,
+		sources: kind === 'full' ? decodeSources(msg) : [],
+		usage: kind === 'usage' ? decodeUsage(msg) : [],
+	}
+	const hwid = leafNumber(term, 'HWID')
+	if (hwid !== undefined) advert.hwid = hwid
+	const configVersion = leafNumber(term, 'ADVV')
+	if (configVersion !== undefined) advert.configVersion = configVersion
+	const sourceCount = leafNumber(term, 'NUMS')
+	if (sourceCount !== undefined) advert.sourceCount = sourceCount
+	const deviceName = leafString(term, 'ATRN')
+	if (deviceName !== undefined) advert.deviceName = deviceName.trim()
+	return advert
 }
