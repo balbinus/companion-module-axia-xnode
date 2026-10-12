@@ -759,6 +759,22 @@ describe('sources ordering and housekeeping', () => {
 		expect(onUsage).not.toHaveBeenCalled()
 	})
 
+	it('deviceCount() counts the devices heard from, with or without known sources', () => {
+		expect(dir.deviceCount()).toBe(0)
+		dir.ingest(keepalive(NODE_IP, 1))
+		expect(dir.deviceCount()).toBe(1)
+		expect(dir.sources()).toEqual([])
+		dir.ingest(keepalive(NODE_IP, 1))
+		dir.ingest(full(ENGINE_IP, [source('S001', 1, 'A')]))
+		expect(dir.deviceCount()).toBe(2)
+		clock += 60_001
+		dir.ingest(keepalive(NODE_IP, 1))
+		dir.expire()
+		expect(dir.deviceCount()).toBe(1)
+		dir.clear()
+		expect(dir.deviceCount()).toBe(0)
+	})
+
 	it('forgets the pending state on clear()', () => {
 		dir.ingest(full(NODE_IP, [source('S001', 1, 'A')], { sourceCount: 2, configVersion: 3 }))
 		dir.clear()

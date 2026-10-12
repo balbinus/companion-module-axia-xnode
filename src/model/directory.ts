@@ -175,6 +175,11 @@ export class LivewireDirectory extends EventEmitter<DirectoryEvents> {
 		if (removed) this.refresh()
 	}
 
+	/** Devices heard from and not expired yet, whether or not their sources are known (diagnostics) */
+	deviceCount(): number {
+		return this.devices.size
+	}
+
 	/** Committed sources, sorted by channel then device IP. The entries are frozen. */
 	sources(): ReadonlyArray<Readonly<DirectorySource>> {
 		return [...this.list]
