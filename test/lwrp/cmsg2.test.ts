@@ -15,23 +15,13 @@ import {
 } from '../../src/lwrp/cmsg2.js'
 import { message, nested, packet, prefix, raw, str, u16, u32, u64, u8 } from '../fixtures/partyline/build.js'
 import { PARTYLINE_FIXTURES, partylineFixture, type PartylineFixtureName } from '../fixtures/partyline/load.js'
+import { rng } from '../fixtures/partyline/rng.js'
 
 /** The decoded top-level message of a fixture */
 function decoded(name: PartylineFixtureName): CMsg2Message {
 	const p = parseCMsg2(partylineFixture(name))
 	if (!p) throw new Error(`fixture ${name} does not decode`)
 	return p.message
-}
-
-/** Small deterministic PRNG (mulberry32) so the mutation tests are reproducible */
-function rng(seed: number): () => number {
-	let a = seed
-	return () => {
-		a = (a + 0x6d2b79f5) | 0
-		let t = Math.imul(a ^ (a >>> 15), 1 | a)
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-	}
 }
 
 describe('constants', () => {
@@ -55,6 +45,11 @@ describe('parseCMsg2Header', () => {
 		const buf = Buffer.concat([prefix(7), Buffer.from('READ'), Buffer.from([0x01, 0x02])])
 		expect(buf.length).toBe(CMSG2_HEADER_SIZE)
 		expect(parseCMsg2Header(buf)).toEqual({ magic: CMSG2_MAGIC, pktNum: 7, messageName: 'READ', numLeaves: 258 })
+	})
+
+	it('reads the message name as ascii, like livewire-gpio: the high bit is masked', () => {
+		const buf = Buffer.concat([prefix(), Buffer.from([0xce, 0xc5, 0xd3, 0xd4, 0, 0])])
+		expect(parseCMsg2Header(buf)?.messageName).toBe('NEST')
 	})
 
 	it('returns null below 22 bytes', () => {
@@ -327,6 +322,15 @@ describe('parseCMsg2 on synthetic packets', () => {
 		expect(p?.message.leaves.map((l) => l.name)).toEqual(['41424300', '1f424344', '4142437f', '41424380', ' ~Az'])
 	})
 
+	it('decodes message names as latin1, so a high-bit name is not NEST (the header is ascii and says NEST)', () => {
+		const name = '\u00ce\u00c5\u00d3\u00d4'
+		const p = parseCMsg2(packet(name, [nested('SUBM', name, [])]))
+		expect(p?.message.name).toBe(name)
+		expect(p?.message.name).not.toBe('NEST')
+		expect(leafMessage(p!.message, 'SUBM')?.name).toBe(name)
+		expect(p?.header.messageName).toBe('NEST')
+	})
+
 	it('keeps leaf order and duplicates; findLeaf returns the first', () => {
 		const msg = parseCMsg2(packet('TEST', [u8('DUPE', 1), u8('OTHR', 5), u8('DUPE', 2)]))!.message
 		expect(msg.leaves.map((l) => l.value)).toEqual([1, 5, 2])
@@ -347,6 +351,16 @@ describe('leaf helpers', () => {
 		expect(findLeaf(msg, 'NUMB')?.type).toBe(CMSG2_TYPE.INT16)
 	})
 
+	it('leafNumber checks the wire width when given a type, and accepts any width when not', () => {
+		expect(leafNumber(msg, 'NUMB', CMSG2_TYPE.INT16)).toBe(12)
+		expect(leafNumber(msg, 'NUMB', CMSG2_TYPE.INT8)).toBeUndefined()
+		expect(leafNumber(msg, 'NUMB', CMSG2_TYPE.INT32)).toBeUndefined()
+		expect(leafNumber(msg, 'NONE', CMSG2_TYPE.INT16)).toBeUndefined()
+		// A u64 is a bigint, never a number
+		expect(leafNumber(msg, 'BIGG', CMSG2_TYPE.INT32)).toBeUndefined()
+		expect(leafNumber(msg, 'NUMB')).toBe(12)
+	})
+
 	it('return undefined when absent or of another type', () => {
 		expect(findLeaf(msg, 'NONE')).toBeUndefined()
 		expect(leafNumber(msg, 'NONE')).toBeUndefined()
@@ -358,5 +372,67 @@ describe('leaf helpers', () => {
 		expect(leafString(msg, 'SUBM')).toBeUndefined()
 		expect(leafMessage(msg, 'NUMB')).toBeUndefined()
 		expect(leafMessage(msg, 'TEXT')).toBeUndefined()
+	})
+})
+
+describe('fixture builder (test/fixtures/partyline/build.ts)', () => {
+	// The synthetic tests are only as good as the builder: it must give the exact wire bytes of real packets
+	const hex = (b: Buffer): string => b.toString('hex')
+
+	it('re-encodes the real keepalive byte for byte', () => {
+		const built = packet(
+			'NEST',
+			[
+				u16('PVER', 2),
+				u8('ADVT', 2),
+				nested('TERM', 'INDI', [
+					u32('ADVV', 451),
+					u16('HWID', 7903),
+					u32('INIP', 0x0a601edf),
+					u16('UDPC', 4000),
+					u16('NUMS', 8),
+				]),
+			],
+			0xc6056085,
+		)
+		expect(hex(built)).toBe(hex(partylineFixture('keepalive-xnode')))
+	})
+
+	it('re-encodes a real usage advert byte for byte (u64 leaves, unprintable keys)', () => {
+		const built = packet(
+			'NEST',
+			[
+				u16('PVER', 2),
+				u8('ADVT', 3),
+				nested('TERM', 'INDI', [u16('HWID', 7903)]),
+				...Array.from({ length: 8 }, (_, i) =>
+					nested(`S00${i + 1}`, 'INDI', [u32('PSID', 22301 + i), u64('BUSY', i === 0 ? 0x00021eeb00000a60n : 0n)]),
+				),
+				u64(Buffer.from([0xff, 0xff, 0xff, 0xff]), 0n),
+				u64(Buffer.from([0xff, 0xff, 0xff, 0xfe]), 0n),
+			],
+			0xc6056086,
+		)
+		expect(hex(built)).toBe(hex(partylineFixture('usage-xnode-fader1')))
+	})
+
+	it('re-encodes a real full advert with a NUL-padded string byte for byte', () => {
+		const built = packet(
+			'NEST',
+			[
+				u16('PVER', 2),
+				u8('ADVT', 1),
+				nested('TERM', 'INDI', [
+					u32('ADVV', 25),
+					u16('HWID', 0x1ee1),
+					u32('INIP', 0x0a601ee1),
+					u16('UDPC', 4000),
+					u16('NUMS', 0),
+					str('ATRN', 'xnode2-815CF7', 32),
+				]),
+			],
+			0x6aa14de5,
+		)
+		expect(hex(built)).toBe(hex(partylineFixture('full-xnode2-empty')))
 	})
 })

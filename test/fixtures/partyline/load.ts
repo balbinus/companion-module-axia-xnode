@@ -1,20 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-export type PartylineFixtureName =
-	| 'keepalive-xnode'
-	| 'full-xnode-224'
-	| 'full-xnode-223'
-	| 'full-xnode-223-renamed'
-	| 'full-engine-part1'
-	| 'full-engine-part2'
-	| 'usage-xnode-fader1'
-	| 'usage-xnode-fader11'
-	| 'usage-engine'
-	| 'full-eth4can'
-	| 'full-xnode2-empty'
-
-export const PARTYLINE_FIXTURES: readonly PartylineFixtureName[] = [
+export const PARTYLINE_FIXTURES = [
 	'keepalive-xnode',
 	'full-xnode-224',
 	'full-xnode-223',
@@ -26,7 +13,9 @@ export const PARTYLINE_FIXTURES: readonly PartylineFixtureName[] = [
 	'usage-engine',
 	'full-eth4can',
 	'full-xnode2-empty',
-]
+] as const
+
+export type PartylineFixtureName = (typeof PARTYLINE_FIXTURES)[number]
 
 /** One real UDP payload from a capture: hex text, `#` comment lines and whitespace ignored */
 export function partylineFixture(name: PartylineFixtureName): Buffer {

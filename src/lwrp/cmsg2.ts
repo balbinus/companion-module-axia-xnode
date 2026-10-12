@@ -2,10 +2,11 @@
  * CMsg2 binary protocol decoder (parse only), as used by the Livewire partyline adverts.
  * See _research/partyline/CMsg2-erratum.md (not in the repository) for the reverse-engineered grammar.
  *
- * This is a strict superset of the header API of companion-module-axia-livewire-gpio's `src/cmsg2.ts`
- * (`CMSG2_MAGIC`, `CMSG2_HEADER_SIZE`, `CMsg2Header`, `parseCMsg2Header` behave the same), so that module can adopt it.
- * Unlike that module's leaf parser, which skips an unknown type as if it had no value and then misparses every
- * following leaf (and cannot read strings or nested messages), `parseCMsg2` rejects the whole packet on an unknown type.
+ * The header API (`CMSG2_MAGIC`, `CMSG2_HEADER_SIZE`, `CMsg2Header`, `parseCMsg2Header`) is identical to
+ * companion-module-axia-livewire-gpio's `src/cmsg2.ts`. The rest is not: a recursive decoder that also supports
+ * strings (0x03) and nested messages (0x06), rejects the whole packet on an unknown type (that module skips it as if
+ * it had no value, then misparses every following leaf), and has no packet builder.
+ * `CMsg2Field` is this module's leaf; it is not that module's `CMsg2Leaf` (`{ lcid, type, rawValue }`).
  *
  * Grammar, everything big-endian:
  *
@@ -43,7 +44,7 @@ export interface CMsg2Header {
 /** u8, u16 and u32 are `number`; u64 is `bigint`; a string is cut at its first NUL (latin1); type 0x06 is a nested message. */
 export type CMsg2Value = number | bigint | string | CMsg2Message
 
-export interface CMsg2Leaf {
+export interface CMsg2Field {
 	/** The raw 4-byte key, big-endian */
 	key: number
 	/** The key as 4 ASCII characters when all four bytes are printable, else 8 hex digits (`ffffffff`) */
@@ -55,7 +56,7 @@ export interface CMsg2Leaf {
 
 export interface CMsg2Message {
 	name: string
-	leaves: CMsg2Leaf[]
+	leaves: CMsg2Field[]
 }
 
 export interface CMsg2Packet {
@@ -67,6 +68,8 @@ export interface CMsg2Packet {
 /**
  * Parse the 22-byte CMsg2 header from a buffer.
  * Returns null if the buffer is too short or the magic/filler are invalid.
+ * Kept identical to livewire-gpio's, so `messageName` is 'ascii': the high bit is masked and CE C5 D3 D4 reads as
+ * "NEST". The names inside `parseCMsg2`'s messages are 'latin1' and keep it.
  */
 export function parseCMsg2Header(buf: Buffer): CMsg2Header | null {
 	if (buf.length < CMSG2_HEADER_SIZE) {
@@ -111,11 +114,12 @@ function keyName(buf: Buffer, pos: number): string {
 /** Parse one message occupying `[pos, end)` at most; returns it with the offset just after its last leaf. */
 function parseMessage(buf: Buffer, pos: number, end: number, depth: number): [CMsg2Message, number] | null {
 	if (depth > CMSG2_MAX_DEPTH || pos + 6 > end) return null
-	const name = buf.toString('ascii', pos, pos + 4)
+	// latin1, not ascii, which would mask the high bit
+	const name = buf.toString('latin1', pos, pos + 4)
 	const count = buf.readUInt16BE(pos + 4)
 	pos += 6
 
-	const leaves: CMsg2Leaf[] = []
+	const leaves: CMsg2Field[] = []
 	for (let i = 0; i < count; i++) {
 		if (pos + 5 > end) return null
 		const key = buf.readUInt32BE(pos)
@@ -177,14 +181,20 @@ export function parseCMsg2(buf: Buffer): CMsg2Packet | null {
 }
 
 /** First leaf of that name (4 ASCII characters, or the 8 hex digits of an unprintable key) */
-export function findLeaf(message: CMsg2Message, name: string): CMsg2Leaf | undefined {
+export function findLeaf(message: CMsg2Message, name: string): CMsg2Field | undefined {
 	return message.leaves.find((l) => l.name === name)
 }
 
-/** Value of a u8/u16/u32 leaf, undefined when absent or of another type */
-export function leafNumber(message: CMsg2Message, name: string): number | undefined {
-	const v = findLeaf(message, name)?.value
-	return typeof v === 'number' ? v : undefined
+/** Wire types that decode to a `number` */
+export type CMsg2IntType = typeof CMSG2_TYPE.INT8 | typeof CMSG2_TYPE.INT16 | typeof CMSG2_TYPE.INT32
+
+/**
+ * Value of a u8/u16/u32 leaf, undefined when absent or of another type.
+ * With `type`, a leaf of another width is undefined too: a u8 where a u32 is expected is not that field.
+ */
+export function leafNumber(message: CMsg2Message, name: string, type?: CMsg2IntType): number | undefined {
+	const leaf = findLeaf(message, name)
+	return typeof leaf?.value === 'number' && (type === undefined || leaf.type === type) ? leaf.value : undefined
 }
 
 /** Value of a u64 leaf, undefined when absent or of another type */

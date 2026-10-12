@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { decodeAdvert, type PartylineAdvert } from '../../src/lwrp/partyline.js'
 import { message, nested, packet, prefix, raw, str, u16, u32, u64, u8 } from '../fixtures/partyline/build.js'
 import { PARTYLINE_FIXTURES, partylineFixture, type PartylineFixtureName } from '../fixtures/partyline/load.js'
+import { rng } from '../fixtures/partyline/rng.js'
 
 function decode(name: PartylineFixtureName, sender: string): PartylineAdvert {
 	const advert = decodeAdvert(partylineFixture(name), sender)
@@ -230,6 +231,7 @@ describe('decodeAdvert: usage adverts', () => {
 		expect(usedBy(0x00021eeb00000a60n)).toEqual({ engineIp: '10.96.30.235', fader: 1 })
 		expect(usedBy(0x00021eeb000a0a60n)).toEqual({ engineIp: '10.96.30.235', fader: 11 })
 		expect(usedBy(0x0000c0a8_0000_0a01n)).toEqual({ engineIp: '10.1.192.168', fader: 1 })
+		// These two pin the arithmetic only (every bit set, an all-zero IP), not anything seen from a real engine
 		expect(usedBy(0xffffffffffffffffn)).toEqual({ engineIp: '255.255.255.255', fader: 65536 })
 		expect(usedBy(0x00020000_0001_0000n)).toEqual({ engineIp: '0.0.0.0', fader: 2 })
 		expect(usedBy(0n)).toBeNull()
@@ -447,11 +449,7 @@ describe('decodeAdvert: rejects what is not an advert', () => {
 	})
 
 	it('never throws on mutated real packets', () => {
-		let seed = 12345
-		const next = (): number => {
-			seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff
-			return seed / 0x80000000
-		}
+		const next = rng(12345)
 		for (const name of PARTYLINE_FIXTURES) {
 			const good = partylineFixture(name)
 			for (let i = 0; i < 300; i++) {
@@ -462,4 +460,221 @@ describe('decodeAdvert: rejects what is not an advert', () => {
 			}
 		}
 	})
+})
+
+describe('decodeAdvert: wire widths', () => {
+	const SENDER = '10.0.0.9'
+	const numeric: ((k: string, v: number) => Buffer)[] = [u8, u16, u32, (k, v) => u64(k, BigInt(v))]
+	const widthOf = [8, 16, 32, 64]
+	/** `key` = `value` at every numeric width but `bits`, and as a string */
+	const wrongWidths = (key: string, value: number, bits: number): Buffer[] => [
+		...numeric.filter((_, i) => widthOf[i] !== bits).map((f) => f(key, value)),
+		str(key, String(value)),
+	]
+	const src = (...leaves: Buffer[]): Buffer => nested('S001', 'INDI', leaves)
+
+	it('ADVT must be a u8: any other width is not an advert', () => {
+		for (const advt of wrongWidths('ADVT', 2, 8)) {
+			const p = packet('NEST', [u16('PVER', 2), advt, nested('TERM', 'INDI', [])])
+			expect(decodeAdvert(p, SENDER), advt.toString('hex')).toBeNull()
+		}
+	})
+
+	it('INIP must be a u32: any other width falls back to the sender address', () => {
+		for (const inip of wrongWidths('INIP', 5, 32))
+			expect(decodeAdvert(nest(2, [inip]), SENDER)?.deviceIp, inip.toString('hex')).toBe(SENDER)
+		expect(decodeAdvert(nest(2, [u32('INIP', 5)]), SENDER)?.deviceIp).toBe('0.0.0.5')
+	})
+
+	it('HWID and NUMS must be u16, ADVV a u32: another width leaves the field out', () => {
+		const field = { HWID: 'hwid', NUMS: 'sourceCount', ADVV: 'configVersion' } as const
+		for (const [key, prop] of Object.entries(field)) {
+			const bits = key === 'ADVV' ? 32 : 16
+			for (const leaf of wrongWidths(key, 5, bits)) {
+				const a = decodeAdvert(nest(1, [leaf]), SENDER)
+				expect(a, `${key} ${leaf.toString('hex')}`).not.toBeNull()
+				expect(a).not.toHaveProperty(prop)
+			}
+		}
+		expect(decodeAdvert(nest(1, [u16('HWID', 5), u16('NUMS', 6), u32('ADVV', 7)]), SENDER)).toMatchObject({
+			hwid: 5,
+			sourceCount: 6,
+			configVersion: 7,
+		})
+	})
+
+	it('ATRN must be a string', () => {
+		for (const atrn of numeric.map((f) => f('ATRN', 5)))
+			expect(decodeAdvert(nest(1, [atrn]), SENDER), atrn.toString('hex')).not.toHaveProperty('deviceName')
+	})
+
+	it('PSID must be a u32: a source of another width is skipped, in full and in usage adverts', () => {
+		for (const psid of wrongWidths('PSID', 5, 32)) {
+			const full = decodeAdvert(nest(1, [], src(psid, str('PSNM', 'x', 8))), SENDER)
+			expect(full?.sources, psid.toString('hex')).toEqual([])
+			const usage = decodeAdvert(nest(3, [], src(psid, u64('BUSY', 0n))), SENDER)
+			expect(usage?.usage, psid.toString('hex')).toEqual([])
+		}
+	})
+
+	it('FSID and BSID must be u32: another width gives the unknown address, the source stays', () => {
+		for (const key of ['FSID', 'BSID'])
+			for (const leaf of wrongWidths(key, 5, 32)) {
+				const a = decodeAdvert(nest(1, [], src(u32('PSID', 7), leaf)), SENDER)
+				expect(a?.sources, `${key} ${leaf.toString('hex')}`).toEqual([
+					{ slot: 'S001', channel: 7, name: '', streamAddress: '', backfeedAddress: '' },
+				])
+			}
+	})
+
+	it('PSNM must be a string, BUSY a u64', () => {
+		for (const psnm of numeric.map((f) => f('PSNM', 5)))
+			expect(decodeAdvert(nest(1, [], src(u32('PSID', 7), psnm)), SENDER)?.sources[0].name).toBe('')
+		for (const busy of wrongWidths('BUSY', 5, 64))
+			expect(decodeAdvert(nest(3, [], src(u32('PSID', 7), busy)), SENDER)?.usage, busy.toString('hex')).toEqual([])
+	})
+})
+
+describe('decodeAdvert: unknown and zero addresses', () => {
+	const src = (...leaves: Buffer[]): Buffer => nested('S001', 'INDI', leaves)
+
+	// '' means unknown, for an absent address and for 0.0.0.0 alike
+	it('maps a zero FSID or BSID to the empty string, like an absent one', () => {
+		const zero = decodeAdvert(nest(1, [], src(u32('PSID', 7), u32('FSID', 0), u32('BSID', 0))), '1.1.1.1')
+		expect(zero?.sources[0]).toMatchObject({ streamAddress: '', backfeedAddress: '' })
+		const half = decodeAdvert(
+			nest(1, [], src(u32('PSID', 7), u32('FSID', 0), u32('BSID', ip(239, 193, 0, 7)))),
+			'1.1.1.1',
+		)
+		expect(half?.sources[0]).toMatchObject({ streamAddress: '', backfeedAddress: '239.193.0.7' })
+	})
+})
+
+describe('decodeAdvert: names', () => {
+	const src = (...leaves: Buffer[]): Buffer => nested('S001', 'INDI', leaves)
+
+	it('drops control characters from names after the NUL cut, then trims', () => {
+		const a = decodeAdvert(
+			nest(
+				1,
+				[str('ATRN', '\x1b[31mNode\x07 7\x7f \x01', 32)],
+				src(u32('PSID', 1), str('PSNM', '\x1b[31m Mic\t1 \0\x1bjunk', 24)),
+			),
+			'1.1.1.1',
+		)
+		expect(a?.deviceName).toBe('[31mNode 7')
+		expect(a?.sources[0].name).toBe('[31m Mic1')
+	})
+
+	it('leaves a name made only of control characters empty, and keeps printable latin1', () => {
+		const a = decodeAdvert(
+			nest(1, [str('ATRN', '\x1b\x07 \x7f', 16)], src(u32('PSID', 1), str('PSNM', 'Café ÿ', 16))),
+			'1.1.1.1',
+		)
+		expect(a?.deviceName).toBe('')
+		expect(a?.sources[0].name).toBe('Café ÿ')
+	})
+
+	it('rejects a high-bit message name that ascii would read as NEST', () => {
+		const p = packet('ÎÅÓÔ', [u16('PVER', 2), u8('ADVT', 2), nested('TERM', 'INDI', [])])
+		expect(p.subarray(16, 20).toString('ascii')).toBe('NEST')
+		expect(decodeAdvert(p, '1.1.1.1')).toBeNull()
+	})
+})
+
+describe('decodeAdvert: deliberate leniency', () => {
+	const SENDER = '10.0.0.9'
+	const term = (hwid: number): Buffer => nested('TERM', 'INDI', [u16('HWID', hwid)])
+
+	it('the first ADVT and the first TERM win, even when the first ADVT has the wrong width', () => {
+		expect(decodeAdvert(packet('NEST', [u8('ADVT', 2), u8('ADVT', 1), term(1), term(2)]), SENDER)).toMatchObject({
+			kind: 'keepalive',
+			hwid: 1,
+		})
+		expect(decodeAdvert(packet('NEST', [u8('ADVT', 1), u8('ADVT', 2), term(2), term(1)]), SENDER)).toMatchObject({
+			kind: 'full',
+			hwid: 2,
+		})
+		expect(decodeAdvert(packet('NEST', [u16('ADVT', 2), u8('ADVT', 2), term(1)]), SENDER)).toBeNull()
+	})
+
+	it('ignores PVER: any value, any type, or none', () => {
+		for (const pver of [u16('PVER', 3), u16('PVER', 99), u8('PVER', 0), str('PVER', 'x')]) {
+			const p = packet('NEST', [pver, u8('ADVT', 2), term(1)])
+			expect(decodeAdvert(p, SENDER), pver.toString('hex')).toMatchObject({ kind: 'keepalive', hwid: 1 })
+		}
+		expect(decodeAdvert(packet('NEST', [u8('ADVT', 2), term(1)]), SENDER)).toMatchObject({ hwid: 1 })
+	})
+
+	it('does not check the message name of TERM and the Snnn leaves (INDI in every capture)', () => {
+		const p = packet('NEST', [
+			u8('ADVT', 1),
+			nested('TERM', 'XXXX', [u16('HWID', 5)]),
+			nested('S001', 'ÎÅÓÔ', [u32('PSID', 9)]),
+		])
+		const a = decodeAdvert(p, SENDER)
+		expect(a?.hwid).toBe(5)
+		expect(a?.sources.map((s) => s.channel)).toEqual([9])
+	})
+})
+
+describe('decodeAdvert: every single-byte mutation of real packets', () => {
+	const QUAD = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/
+	const u32max = 0xffffffff
+
+	/** What is wrong with a decoded advert, if anything */
+	function problems(a: PartylineAdvert): string[] {
+		const out: string[] = []
+		const isInt = (n: unknown, min: number, max: number): boolean =>
+			typeof n === 'number' && Number.isInteger(n) && n >= min && n <= max
+		const check = (ok: boolean, what: string): void => {
+			if (!ok) out.push(what)
+		}
+		// eslint-disable-next-line no-control-regex
+		const cleanName = (n: string): boolean => n === n.trim() && !/[\x00-\x1f\x7f]/.test(n)
+		check(['keepalive', 'full', 'usage'].includes(a.kind), `kind ${a.kind}`)
+		check(QUAD.test(a.deviceIp), `deviceIp ${a.deviceIp}`)
+		check(a.hwid === undefined || isInt(a.hwid, 0, 0xffff), `hwid ${a.hwid}`)
+		check(a.configVersion === undefined || isInt(a.configVersion, 0, u32max), `configVersion ${a.configVersion}`)
+		check(a.sourceCount === undefined || isInt(a.sourceCount, 0, 0xffff), `sourceCount ${a.sourceCount}`)
+		check(a.deviceName === undefined || cleanName(a.deviceName), `deviceName ${JSON.stringify(a.deviceName)}`)
+		for (const s of a.sources) {
+			check(isInt(s.channel, 0, u32max), `channel ${s.channel}`)
+			check(cleanName(s.name), `source name ${JSON.stringify(s.name)}`)
+			for (const addr of [s.streamAddress, s.backfeedAddress]) check(addr === '' || QUAD.test(addr), `address ${addr}`)
+		}
+		for (const u of a.usage) {
+			check(isInt(u.channel, 0, u32max), `usage channel ${u.channel}`)
+			if (u.usedBy) {
+				check(QUAD.test(u.usedBy.engineIp), `engineIp ${u.usedBy.engineIp}`)
+				check(isInt(u.usedBy.fader, 1, 65536), `fader ${u.usedBy.fader}`)
+			}
+		}
+		check(a.kind === 'full' || a.sources.length === 0, 'sources outside a full advert')
+		check(a.kind === 'usage' || a.usage.length === 0, 'usage outside a usage advert')
+		return out
+	}
+
+	// A keepalive has no sources: the others add source and usage fields (a channel is a u32, so any value goes)
+	it.each(['keepalive-xnode', 'full-xnode2-empty', 'usage-xnode-fader1', 'full-engine-part2'] as const)(
+		'%s: never throws, and every advert it still decodes is sane',
+		(name) => {
+			const good = partylineFixture(name)
+			const bad: string[] = []
+			for (let i = 0; i < good.length; i++) {
+				const buf = Buffer.from(good)
+				for (let v = 0; v < 256; v++) {
+					if (v === good[i]) continue
+					buf[i] = v
+					try {
+						const a = decodeAdvert(buf, '1.1.1.1')
+						if (a) for (const p of problems(a)) bad.push(`byte ${i} = ${v}: ${p}`)
+					} catch (e) {
+						bad.push(`byte ${i} = ${v} threw ${String(e)}`)
+					}
+				}
+			}
+			expect(bad).toEqual([])
+		},
+	)
 })

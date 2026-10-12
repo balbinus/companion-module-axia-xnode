@@ -3,7 +3,7 @@
  * See _research/partyline/CMsg2-erratum.md (not in the repository) for the reverse-engineered format.
  */
 
-import { leafBigInt, leafMessage, leafNumber, leafString, parseCMsg2, type CMsg2Message } from './cmsg2.js'
+import { CMSG2_TYPE, leafBigInt, leafMessage, leafNumber, leafString, parseCMsg2, type CMsg2Message } from './cmsg2.js'
 
 export const PARTYLINE_GROUP = '239.192.255.3'
 export const PARTYLINE_PORT = 4001
@@ -82,21 +82,30 @@ function* slots(msg: CMsg2Message): Generator<[string, CMsg2Message]> {
 	}
 }
 
-/** A missing address stays '' rather than dropping the source: name and channel are still useful */
+/** A name from the wire (already cut at its first NUL): control characters (C0, DEL) dropped, then trimmed */
+function cleanName(s: string): string {
+	// eslint-disable-next-line no-control-regex
+	return s.replace(/[\x00-\x1f\x7f]/g, '').trim()
+}
+
+/**
+ * '' means unknown: an absent, zero (0.0.0.0) or wrong-width address. The source is kept anyway, as its name and
+ * channel are still useful.
+ */
 function addressOf(src: CMsg2Message, key: string): string {
-	const n = leafNumber(src, key)
-	return n === undefined ? '' : dottedQuad(n)
+	const n = leafNumber(src, key, CMSG2_TYPE.INT32)
+	return n ? dottedQuad(n) : ''
 }
 
 function decodeSources(msg: CMsg2Message): AdvertisedSource[] {
 	const out: AdvertisedSource[] = []
 	for (const [slot, src] of slots(msg)) {
-		const channel = leafNumber(src, 'PSID')
+		const channel = leafNumber(src, 'PSID', CMSG2_TYPE.INT32)
 		if (channel === undefined) continue
 		out.push({
 			slot,
 			channel,
-			name: (leafString(src, 'PSNM') ?? '').trim(),
+			name: cleanName(leafString(src, 'PSNM') ?? ''),
 			streamAddress: addressOf(src, 'FSID'),
 			backfeedAddress: addressOf(src, 'BSID'),
 		})
@@ -115,7 +124,7 @@ function decodeBusy(busy: bigint): SourceUser | null {
 function decodeUsage(msg: CMsg2Message): SourceUsage[] {
 	const out: SourceUsage[] = []
 	for (const [, src] of slots(msg)) {
-		const channel = leafNumber(src, 'PSID')
+		const channel = leafNumber(src, 'PSID', CMSG2_TYPE.INT32)
 		const busy = leafBigInt(src, 'BUSY')
 		if (channel === undefined || busy === undefined) continue
 		out.push({ channel, usedBy: decodeBusy(busy) })
@@ -127,24 +136,24 @@ function decodeUsage(msg: CMsg2Message): SourceUsage[] {
 export function decodeAdvert(buf: Buffer, senderIp: string): PartylineAdvert | null {
 	const msg = parseCMsg2(buf)?.message
 	if (msg?.name !== 'NEST') return null
-	const kind = kindOf(leafNumber(msg, 'ADVT'))
+	const kind = kindOf(leafNumber(msg, 'ADVT', CMSG2_TYPE.INT8))
 	const term = leafMessage(msg, 'TERM')
 	if (kind === undefined || term === undefined) return null
 
-	const inip = leafNumber(term, 'INIP')
+	const inip = leafNumber(term, 'INIP', CMSG2_TYPE.INT32)
 	const advert: PartylineAdvert = {
 		kind,
 		deviceIp: inip ? dottedQuad(inip) : senderIp,
 		sources: kind === 'full' ? decodeSources(msg) : [],
 		usage: kind === 'usage' ? decodeUsage(msg) : [],
 	}
-	const hwid = leafNumber(term, 'HWID')
+	const hwid = leafNumber(term, 'HWID', CMSG2_TYPE.INT16)
 	if (hwid !== undefined) advert.hwid = hwid
-	const configVersion = leafNumber(term, 'ADVV')
+	const configVersion = leafNumber(term, 'ADVV', CMSG2_TYPE.INT32)
 	if (configVersion !== undefined) advert.configVersion = configVersion
-	const sourceCount = leafNumber(term, 'NUMS')
+	const sourceCount = leafNumber(term, 'NUMS', CMSG2_TYPE.INT16)
 	if (sourceCount !== undefined) advert.sourceCount = sourceCount
 	const deviceName = leafString(term, 'ATRN')
-	if (deviceName !== undefined) advert.deviceName = deviceName.trim()
+	if (deviceName !== undefined) advert.deviceName = cleanName(deviceName)
 	return advert
 }
