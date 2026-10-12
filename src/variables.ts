@@ -31,7 +31,7 @@ export function UpdateVariableValues(self: ModuleInstance, changes: StateChange[
 		cache = { defined: new Set(), values: new Map() }
 		sent.set(self, cache)
 	}
-	const all = computeVariableValues(self.controller.state, self.config, self.controller.levelsReady)
+	const all = computeVariableValues(self.controller.state, self.config, self.controller.levelsReady, self.directory)
 	const diff: Record<string, VarValue> = {}
 	let count = 0
 	for (const [id, value] of Object.entries(all)) {

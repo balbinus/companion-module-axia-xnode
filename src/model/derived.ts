@@ -1,7 +1,9 @@
 /** Pure value computations for variables and feedbacks. No dependency on Companion's InstanceBase. */
 import type { ModuleConfig } from '../config.js'
 import { channelToMulticast, normaliseAddr, parseDstAddr, type ChannelKind } from '../lwrp/livewire.js'
+import type { SourceUser } from '../lwrp/partyline.js'
 import { dbToTenths, formatDb, isXpointOn } from '../lwrp/units.js'
+import type { LivewireDirectory } from './directory.js'
 import { channelLabel, pairLabel, type MixChannel } from './iomap.js'
 import type { LevelSide, LevelState, MeterKind, StateChange, StateKind, XNodeState } from './state.js'
 
@@ -10,6 +12,9 @@ export type VarValues = Record<string, VarValue>
 export type VarDefinitions = Record<string, { name: string }>
 
 export type DerivedConfig = Pick<ModuleConfig, 'meterMode' | 'exposeXpointVariables' | 'levelAlerts'>
+
+/** What the variables and feedbacks need from the Livewire source directory (absent: discovery is off) */
+export type DirectoryView = Pick<LivewireDirectory, 'lookupAddress' | 'usedBy'>
 
 export type SignalState = 'clip' | 'low' | 'ok' | ''
 
@@ -97,6 +102,7 @@ export function computeVariableDefinitions(state: XNodeState, config: DerivedCon
 		add(`src_${n}_enabled`, `${t}: stream enabled (on/off)`)
 		add(`src_${n}_address`, `${t}: stream address`)
 		add(`src_${n}_channel`, `${t}: Livewire channel`)
+		add(`src_${n}_used_by`, `${t}: console using this source`)
 		add(`src_${n}_mode`, `${t}: stream mode`)
 		add(`src_${n}_gain`, `${t}: input gain (dB)`)
 		if (signals) add(`src_${n}_signal`, `${t}: signal state (ok/low/clip)`)
@@ -111,6 +117,7 @@ export function computeVariableDefinitions(state: XNodeState, config: DerivedCon
 		add(`dst_${n}_address`, `${t}: connected address`)
 		add(`dst_${n}_channel`, `${t}: Livewire channel`)
 		add(`dst_${n}_source_label`, `${t}: source label`)
+		add(`dst_${n}_source_name`, `${t}: source name (from Livewire adverts)`)
 		add(`dst_${n}_gain`, `${t}: output gain (dB)`)
 		if (signals) add(`dst_${n}_signal`, `${t}: signal state (ok/low/clip)`)
 		if (meters) {
@@ -208,7 +215,44 @@ export function mixOutputSummary(state: XNodeState, output: number): string {
 	return parts.join(' + ')
 }
 
-export function computeVariableValues(state: XNodeState, config: DerivedConfig, levelsReady: boolean): VarValues {
+/** Livewire channel of a SRC from its RTPA (`239.192.87.29;rtp-pt=97`, or a bare channel number) */
+export function srcChannel(rtpa: string | undefined): number | undefined {
+	return parseDstAddr((rtpa ?? '').split(';')[0].trim()).channel
+}
+
+/** The console engine using a SRC's channel (BUSY in the Livewire adverts); null when unused or unknown */
+export function srcUser(
+	directory: Pick<LivewireDirectory, 'usedBy'> | undefined,
+	rtpa: string | undefined,
+): SourceUser | null {
+	const channel = srcChannel(rtpa)
+	return directory && channel !== undefined ? directory.usedBy(channel) : null
+}
+
+/** `10.96.30.235/11` (engine IP / fader number); '' when nobody uses the source */
+export function srcUsedByText(
+	directory: Pick<LivewireDirectory, 'usedBy'> | undefined,
+	rtpa: string | undefined,
+): string {
+	const user = srcUser(directory, rtpa)
+	return user ? `${user.engineIp}/${user.fader}` : ''
+}
+
+/** Name of what a DST listens to, from the Livewire adverts: `To: MIC 1` for a backfeed. '' when unknown. */
+export function dstSourceName(directory: Pick<LivewireDirectory, 'lookupAddress'> | undefined, addr: string): string {
+	const ip = parseDstAddr(addr).ip
+	const hit = ip === undefined ? undefined : directory?.lookupAddress(ip)
+	if (!hit || hit.source.name === '') return ''
+	const name = hit.source.name
+	return hit.kind === 'to' && !/^to:/i.test(name) ? `To: ${name}` : name
+}
+
+export function computeVariableValues(
+	state: XNodeState,
+	config: DerivedConfig,
+	levelsReady: boolean,
+	directory?: DirectoryView,
+): VarValues {
 	const v: VarValues = {}
 	v.model = state.ver.MODEL ?? ''
 	v.devn = state.ver.DEVN ?? ''
@@ -236,11 +280,11 @@ export function computeVariableValues(state: XNodeState, config: DerivedConfig, 
 	const meters = config.meterMode !== 'off'
 	for (const n of range(state.nsrc)) {
 		const a = state.src.get(n) ?? {}
-		const addr = (a.RTPA ?? '').split(';')[0].trim()
 		v[`src_${n}_name`] = a.PSNM ?? ''
 		v[`src_${n}_enabled`] = a.RTPE === undefined ? '' : a.RTPE === '1' ? 'on' : 'off'
 		v[`src_${n}_address`] = a.RTPA ?? ''
-		v[`src_${n}_channel`] = parseDstAddr(addr).channel ?? ''
+		v[`src_${n}_channel`] = srcChannel(a.RTPA) ?? ''
+		v[`src_${n}_used_by`] = srcUsedByText(directory, a.RTPA)
 		v[`src_${n}_mode`] = srcModeLabel(a.RTPP)
 		v[`src_${n}_gain`] = gainText(a.INGN, state.src.has(n))
 		if (signals) v[`src_${n}_signal`] = signalState(state.lvl.ICH.get(n), levelsReady)
@@ -254,6 +298,7 @@ export function computeVariableValues(state: XNodeState, config: DerivedConfig, 
 		v[`dst_${n}_address`] = addr
 		v[`dst_${n}_channel`] = p.channel ?? ''
 		v[`dst_${n}_source_label`] = p.label ?? p.channel ?? p.ip ?? ''
+		v[`dst_${n}_source_name`] = dstSourceName(directory, addr)
 		v[`dst_${n}_gain`] = gainText(a.OUGN, state.dst.has(n))
 		if (signals) v[`dst_${n}_signal`] = signalState(state.lvl.OCH.get(n), levelsReady)
 		if (meters) setPeaks(v, `dst_${n}`, state, 'OCH', n, true)
@@ -365,6 +410,19 @@ export function evaluateSrcEnabled(state: XNodeState, src: number): boolean {
 	return state.src.get(src)?.RTPE === '1'
 }
 
+/** The SRC's channel is used by a console engine (optionally: by this one, an IP). False when discovery is off or nothing is known. */
+export function evaluateSrcInUse(
+	state: XNodeState,
+	directory: Pick<LivewireDirectory, 'usedBy'> | undefined,
+	src: number,
+	engine: string | undefined,
+): boolean {
+	const user = srcUser(directory, state.src.get(src)?.RTPA)
+	if (!user) return false
+	const wanted = (engine ?? '').trim()
+	return wanted === '' || wanted === user.engineIp
+}
+
 export type LevelSideOption = 'L' | 'R' | 'either' | 'both'
 export type LevelCondition = 'present' | 'silence' | 'clip'
 
@@ -416,6 +474,7 @@ export type FeedbackId =
 	| 'dst_connected_to'
 	| 'dst_connected'
 	| 'src_enabled'
+	| 'src_in_use'
 	| 'level_state'
 	| 'mixer_factory_mode'
 	| 'xpoint_budget'
@@ -429,6 +488,7 @@ export const ALL_FEEDBACK_IDS: readonly FeedbackId[] = [
 	'dst_connected_to',
 	'dst_connected',
 	'src_enabled',
+	'src_in_use',
 	'level_state',
 	'mixer_factory_mode',
 	'xpoint_budget',
@@ -442,7 +502,7 @@ const FEEDBACKS_BY_KIND: Partial<Record<StateKind, readonly FeedbackId[]>> = {
 	mix: ['mix_xpoint_active', 'mix_output_exclusive', 'xpoint_budget'],
 	mixcfg: ['mixer_factory_mode'],
 	dst: ['dst_connected_to', 'dst_connected'],
-	src: ['src_enabled'],
+	src: ['src_enabled', 'src_in_use'],
 	lvl: ['level_state'],
 	gpi: ['gpi_active'],
 	gpo: ['gpo_active'],

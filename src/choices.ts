@@ -1,4 +1,6 @@
 import type { CompanionInputFieldDropdown, DropdownChoice } from '@companion-module/base'
+import type { KnownSource } from './lwrp/livewire.js'
+import type { LivewireDirectory } from './model/directory.js'
 import { channelLabel, findChannel, pairLabel, type MixIoMap } from './model/iomap.js'
 import type { XNodeState } from './model/state.js'
 
@@ -52,6 +54,31 @@ export function srcChoices(state: XNodeState): DropdownChoice<number>[] {
 /** "DST 2 · Program 3" */
 export function dstChoices(state: XNodeState): DropdownChoice<number>[] {
 	return range(state.ndst, (n) => `DST ${n}${nameSuffix(state.dstName(n), `DST ${n}`)}`)
+}
+
+/**
+ * Livewire sources to pick from, by multicast address: the configured known sources first, then the ones heard on
+ * the network that are not listed yet (by address), in channel order.
+ */
+export function sourceChoices(
+	knownSources: KnownSource[],
+	directory?: Pick<LivewireDirectory, 'sources'>,
+): DropdownChoice<string>[] {
+	const choices: DropdownChoice<string>[] = []
+	const listed = new Set<string>()
+	for (const s of knownSources) {
+		listed.add(s.ip)
+		choices.push({ id: s.ip, label: `${s.channel ? s.channel : s.ip} · ${s.label}` })
+	}
+	for (const s of directory?.sources() ?? []) {
+		if (s.streamAddress === '' || listed.has(s.streamAddress)) continue
+		listed.add(s.streamAddress)
+		choices.push({
+			id: s.streamAddress,
+			label: `${s.channel} · ${s.name ? `${s.name} ` : ''}(${s.deviceName})`,
+		})
+	}
+	return choices
 }
 
 export function gpiChoices(state: XNodeState): DropdownChoice<number>[] {

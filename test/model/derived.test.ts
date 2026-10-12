@@ -61,10 +61,10 @@ describe('variable definitions', () => {
 	it('defines per SRC / DST variables for the counts in VER', () => {
 		const d = ids(legacyA(), cfg())
 		for (const n of [1, 8]) {
-			for (const k of ['name', 'enabled', 'address', 'channel', 'mode', 'gain', 'signal']) {
+			for (const k of ['name', 'enabled', 'address', 'channel', 'used_by', 'mode', 'gain', 'signal']) {
 				expect(d).toContain(`src_${n}_${k}`)
 			}
-			for (const k of ['name', 'address', 'channel', 'source_label', 'gain', 'signal']) {
+			for (const k of ['name', 'address', 'channel', 'source_label', 'source_name', 'gain', 'signal']) {
 				expect(d).toContain(`dst_${n}_${k}`)
 			}
 		}
@@ -755,7 +755,7 @@ describe('feedbackIdsForChanges', () => {
 		)
 		expect(feedbackIdsForChanges([{ kind: 'mixcfg' }])).toEqual(['mixer_factory_mode'])
 		expect(feedbackIdsForChanges([{ kind: 'dst' }]).sort()).toEqual(['dst_connected', 'dst_connected_to'])
-		expect(feedbackIdsForChanges([{ kind: 'src' }])).toEqual(['src_enabled'])
+		expect(feedbackIdsForChanges([{ kind: 'src' }]).sort()).toEqual(['src_enabled', 'src_in_use'])
 		expect(feedbackIdsForChanges([{ kind: 'lvl' }])).toEqual(['level_state'])
 		expect(feedbackIdsForChanges([{ kind: 'gpi' }])).toEqual(['gpi_active'])
 		expect(feedbackIdsForChanges([{ kind: 'gpo' }])).toEqual(['gpo_active'])
@@ -767,6 +767,6 @@ describe('feedbackIdsForChanges', () => {
 	})
 	it('combines kinds', () => {
 		const r = feedbackIdsForChanges([{ kind: 'src' }, { kind: 'gpo' }, { kind: 'src' }])
-		expect(r.sort()).toEqual(['gpo_active', 'src_enabled'])
+		expect(r.sort()).toEqual(['gpo_active', 'src_enabled', 'src_in_use'])
 	})
 })

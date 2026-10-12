@@ -11,6 +11,7 @@ import {
 	micChoices,
 	PIN_CHOICES,
 	resolveXpoints,
+	sourceChoices,
 	srcChoices,
 	xpointPickerFields,
 	type XpointPickerOptions,
@@ -290,7 +291,7 @@ export function UpdateActions(self: ModuleInstance): void {
 		defs.dst_connect_channel = {
 			name: 'Destination: connect to Livewire channel',
 			description:
-				'Pick a known source (Module config) or enter a channel number. "To" is the backfeed range (239.193).',
+				'Pick a known or discovered source, or enter a channel number. "To" is the backfeed range (239.193).',
 			options: [
 				dstField(),
 				{
@@ -298,10 +299,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					id: 'source',
 					label: 'Source',
 					choices: [
-						...knownSources.map((s) => ({
-							id: s.ip,
-							label: s.channel ? `${s.channel} · ${s.label}` : `${s.ip} · ${s.label}`,
-						})),
+						...sourceChoices(knownSources, self.directory),
 						{ id: CUSTOM_SOURCE, label: 'Custom channel number' },
 					],
 					default: knownSources[0]?.ip ?? CUSTOM_SOURCE,

@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { CheckFeedbacksForChanges, UpdateFeedbacks } from '../src/feedbacks.js'
 import { UpdateActions } from '../src/actions.js'
 import type ModuleInstance from '../src/main.js'
+import type { LivewireDirectory } from '../src/model/directory.js'
 import { apply, loadedState, type FixtureName } from './fixtures/load.js'
+import { networkDirectory } from './helpers/directory.js'
 
 const ACTION_IDS = [
 	'mix_set',
@@ -36,6 +38,7 @@ const FEEDBACK_IDS = [
 	'dst_connected_to',
 	'dst_connected',
 	'src_enabled',
+	'src_in_use',
 	'level_state',
 	'mixer_factory_mode',
 	'xpoint_budget',
@@ -46,7 +49,7 @@ const FEEDBACK_IDS = [
 
 type Any = any
 
-function fakeSelf(fixture: FixtureName | null, levelsReady = true) {
+function fakeSelf(fixture: FixtureName | null, levelsReady = true, directory?: LivewireDirectory) {
 	const state = loadedState(fixture ?? 'legacy-analog4x4-a')
 	if (fixture === null) state.reset()
 	const ops = new Proxy({} as Record<string, ReturnType<typeof vi.fn>>, {
@@ -57,6 +60,7 @@ function fakeSelf(fixture: FixtureName | null, levelsReady = true) {
 	const self = {
 		controller: { state, levelsReady },
 		config: { knownSources: '22301=Studio Mic 1\n239.192.87.29=Other' },
+		directory,
 		ops,
 		log: vi.fn(),
 		actions: {} as Any,
@@ -366,7 +370,157 @@ describe('feedback definitions', () => {
 			{ kind: 'src', index: 1, rebuild: false },
 		])
 		expect(new Set(self.checkFeedbacks.mock.calls[0])).toEqual(
-			new Set(['mix_xpoint_active', 'mix_output_exclusive', 'xpoint_budget', 'src_enabled']),
+			new Set(['mix_xpoint_active', 'mix_output_exclusive', 'xpoint_budget', 'src_enabled', 'src_in_use']),
 		)
+	})
+})
+
+describe('source discovery in the definitions', () => {
+	const option = (def: Any, id: string): Any => def.options.find((o: Any) => o.id === id)
+	const ids = (choices: Any[]): string[] => choices.map((c) => c.id)
+
+	describe('dst_connect_channel', () => {
+		it('offers the known sources, then the discovered ones, then the custom entry', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateActions(asSelf(self))
+			const choices = option(self.actions.dst_connect_channel, 'source').choices
+			expect(choices).toHaveLength(2 + 25 + 1) // known (two entries, one address), 26 discovered minus 1 listed
+			expect(ids(choices).slice(0, 2)).toEqual(['239.192.87.29', '239.192.87.29'])
+			expect(choices[2]).toEqual({ id: '239.192.0.141', label: '141 · Program 1 (Engine402F59)' })
+			expect(choices.at(-1)).toEqual({ id: 'custom', label: 'Custom channel number' })
+			expect(self.actions.dst_connect_channel.description).toMatch(/known or discovered source/)
+		})
+
+		it('keeps its definition stable: the default does not depend on what was discovered', () => {
+			const without = fakeSelf('legacy-analog4x4-a')
+			const withDiscovery = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateActions(asSelf(without.self))
+			UpdateActions(asSelf(withDiscovery.self))
+			expect(option(withDiscovery.self.actions.dst_connect_channel, 'source').default).toBe(
+				option(without.self.actions.dst_connect_channel, 'source').default,
+			)
+
+			// no known source at all: the default is still the custom entry, whatever is on the network
+			for (const f of [without, withDiscovery]) {
+				f.self.config.knownSources = ''
+				UpdateActions(asSelf(f.self))
+				expect(option(f.self.actions.dst_connect_channel, 'source').default).toBe('custom')
+			}
+		})
+
+		it('every dropdown default is one of its choices, with discovery too', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			self.config.knownSources = ''
+			UpdateActions(asSelf(self))
+			for (const def of Object.values<Any>(self.actions)) {
+				for (const o of def.options) {
+					if (o.type === 'dropdown' && o.choices.length > 0) expect(ids(o.choices)).toContain(o.default)
+				}
+			}
+		})
+
+		it('connects to a discovered source by its address', async () => {
+			const { self, ops } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateActions(asSelf(self))
+			await self.actions.dst_connect_channel.callback({ options: { dst: 2, source: '239.192.87.129' } })
+			expect(ops.dstConnectAddress).toHaveBeenCalledWith(2, '239.192.87.129')
+		})
+
+		it('follows the directory when the definitions are built again', () => {
+			const directory = networkDirectory(['full-xnode-224'])
+			const { self } = fakeSelf('legacy-analog4x4-a', true, directory)
+			UpdateActions(asSelf(self))
+			expect(option(self.actions.dst_connect_channel, 'source').choices).toHaveLength(2 + 8 + 1)
+			directory.clear()
+			UpdateActions(asSelf(self))
+			expect(option(self.actions.dst_connect_channel, 'source').choices).toHaveLength(2 + 1)
+		})
+	})
+
+	describe('dst_connected_to', () => {
+		it('lists the known and the discovered sources in the "known" target', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateFeedbacks(asSelf(self))
+			const def = self.feedbacks.dst_connected_to
+			expect(option(def, 'target').choices[0]).toEqual({ id: 'known', label: 'Known or discovered source' })
+			const known = option(def, 'known')
+			expect(known.label).toBe('Known or discovered source')
+			expect(known.choices).toHaveLength(2 + 25)
+			expect(known.choices[2]).toEqual({ id: '239.192.0.141', label: '141 · Program 1 (Engine402F59)' })
+		})
+
+		it('keeps its defaults independent of discovery', () => {
+			const defaults = (directory?: LivewireDirectory, known = '22301=Studio Mic 1'): [unknown, unknown] => {
+				const { self } = fakeSelf('legacy-analog4x4-a', true, directory)
+				self.config.knownSources = known
+				UpdateFeedbacks(asSelf(self))
+				const def = self.feedbacks.dst_connected_to
+				return [option(def, 'target').default, option(def, 'known').default]
+			}
+			expect(defaults(undefined)).toEqual(['known', '239.192.87.29'])
+			expect(defaults(networkDirectory())).toEqual(['known', '239.192.87.29'])
+			expect(defaults(undefined, '')).toEqual(['channel', ''])
+			expect(defaults(networkDirectory(), '')).toEqual(['channel', ''])
+		})
+
+		it('evaluates a discovered address like any other', () => {
+			const { self, state } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			apply(state, 'DST 3 ADDR:"239.192.87.129"')
+			UpdateFeedbacks(asSelf(self))
+			const fb = (options: Record<string, unknown>): boolean => self.feedbacks.dst_connected_to.callback({ options })
+			expect(fb({ dst: 3, target: 'known', known: '239.192.87.129' })).toBe(true)
+			expect(fb({ dst: 2, target: 'known', known: '239.192.87.129' })).toBe(false)
+		})
+	})
+
+	describe('src_in_use', () => {
+		it('is a boolean feedback on a SRC and an optional engine IP, amber by default', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a')
+			UpdateFeedbacks(asSelf(self))
+			const def = self.feedbacks.src_in_use
+			expect(def).toMatchObject({ type: 'boolean', name: 'Source: in use by a console' })
+			expect(def.options.map((o: Any) => o.id)).toEqual(['src', 'engine'])
+			expect(option(def, 'src').choices).toHaveLength(8)
+			expect(option(def, 'engine')).toMatchObject({
+				type: 'textinput',
+				default: '',
+				label: 'Console engine IP (empty = any)',
+			})
+			expect(def.defaultStyle.bgcolor).toBe(self.feedbacks.mixer_factory_mode.defaultStyle.bgcolor)
+			expect(def.description).toMatch(/console engine owns this SRC/)
+		})
+
+		it('is true while a console engine uses the SRC channel', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateFeedbacks(asSelf(self))
+			const fb = (options: Record<string, unknown>): boolean => self.feedbacks.src_in_use.callback({ options })
+			expect(fb({ src: 1, engine: '' })).toBe(true)
+			expect(fb({ src: 1, engine: '10.96.30.235' })).toBe(true)
+			expect(fb({ src: 1, engine: '10.96.30.236' })).toBe(false)
+			expect(fb({ src: 2, engine: '' })).toBe(false)
+			expect(fb({ src: 1 })).toBe(true) // the engine option may be missing in a saved button
+		})
+
+		it('is false when discovery is off', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a')
+			UpdateFeedbacks(asSelf(self))
+			expect(self.feedbacks.src_in_use.callback({ options: { src: 1, engine: '' } })).toBe(false)
+		})
+
+		it('reads the directory when it is evaluated, not when it is defined', () => {
+			const directory = networkDirectory()
+			const { self } = fakeSelf('legacy-analog4x4-a', true, directory)
+			UpdateFeedbacks(asSelf(self))
+			const fb = (): boolean => self.feedbacks.src_in_use.callback({ options: { src: 1, engine: '' } })
+			expect(fb()).toBe(true)
+			directory.clear()
+			expect(fb()).toBe(false)
+		})
+
+		it('is re-checked when a SRC changes (its address may move)', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a')
+			CheckFeedbacksForChanges(asSelf(self), [{ kind: 'src', index: 1, rebuild: false }])
+			expect(self.checkFeedbacks.mock.calls[0]).toContain('src_in_use')
+		})
 	})
 })

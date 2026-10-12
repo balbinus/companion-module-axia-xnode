@@ -13,6 +13,7 @@ import {
 	micChoices,
 	PIN_CHOICES,
 	resolveXpoints,
+	sourceChoices,
 	srcChoices,
 	xpointPickerFields,
 	type XpointPickerOptions,
@@ -27,6 +28,7 @@ import {
 	evaluateOutputExclusive,
 	evaluatePhantom,
 	evaluateSrcEnabled,
+	evaluateSrcInUse,
 	evaluateXpointActive,
 	evaluateXpointBudget,
 	feedbackIdsForChanges,
@@ -65,6 +67,7 @@ export type FeedbacksSchema = {
 	}
 	dst_connected: { type: 'boolean'; options: { dst: number } }
 	src_enabled: { type: 'boolean'; options: { src: number } }
+	src_in_use: { type: 'boolean'; options: { src: number; engine: string } }
 	level_state: {
 		type: 'boolean'
 		options: {
@@ -91,10 +94,9 @@ function visibleWhen(field: string, value: string): string {
 export function UpdateFeedbacks(self: ModuleInstance): void {
 	const { state } = self.controller
 	const known = parseKnownSources(self.config.knownSources ?? '')
-	const knownChoices: DropdownChoice<string>[] = known.map((k) => ({
-		id: k.ip,
-		label: k.channel === undefined ? `${k.label} (${k.ip})` : `${k.label} (${k.channel})`,
-	}))
+	// The defaults only look at the known sources, so that the definitions do not change as sources are discovered
+	const hasKnown = known.length > 0
+	const knownChoices = sourceChoices(known, self.directory)
 	const physChoices = (dir: 'in' | 'out'): DropdownChoice<number>[] =>
 		physPorts(state, dir).map((p) => ({ id: p.n, label: `${p.n} · ${p.label}` }))
 
@@ -175,19 +177,19 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 					id: 'target',
 					label: 'Source given as',
 					choices: [
-						{ id: 'known', label: 'Known source (from the module config)' },
+						{ id: 'known', label: 'Known or discovered source' },
 						{ id: 'channel', label: 'Livewire channel number' },
 						{ id: 'address', label: 'Multicast address' },
 					],
-					default: knownChoices.length > 0 ? 'known' : 'channel',
+					default: hasKnown ? 'known' : 'channel',
 					disableAutoExpression: true,
 				},
 				{
 					type: 'dropdown',
 					id: 'known',
-					label: 'Known source',
+					label: 'Known or discovered source',
 					choices: knownChoices,
-					default: knownChoices[0]?.id ?? '',
+					default: known[0]?.ip ?? '',
 					isVisibleExpression: visibleWhen('target', 'known'),
 				},
 				{
@@ -250,6 +252,25 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 			options: [dropdown('src', 'Source', srcChoices(state))],
 			defaultStyle: green,
 			callback: (fb) => evaluateSrcEnabled(self.controller.state, Number(fb.options.src)),
+		},
+		src_in_use: {
+			type: 'boolean',
+			name: 'Source: in use by a console',
+			description:
+				'True when a console engine owns this SRC (from the Livewire adverts: it generates the backfeed and the source GPIO). Needs "Discover Livewire sources" in the module config.',
+			options: [
+				dropdown('src', 'Source', srcChoices(state)),
+				{
+					type: 'textinput',
+					id: 'engine',
+					label: 'Console engine IP (empty = any)',
+					default: '',
+					useVariables: true,
+				},
+			],
+			defaultStyle: amber,
+			callback: (fb) =>
+				evaluateSrcInUse(self.controller.state, self.directory, Number(fb.options.src), fb.options.engine ?? ''),
 		},
 		level_state: {
 			type: 'boolean',

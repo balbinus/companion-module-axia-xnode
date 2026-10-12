@@ -11,11 +11,15 @@ import {
 	outputChannelChoices,
 	outputPairChoices,
 	resolveXpoints,
+	sourceChoices,
 	srcChoices,
 	xpointPickerFields,
 } from '../src/choices.js'
+import { parseKnownSources } from '../src/lwrp/livewire.js'
+import type { DirectorySource } from '../src/model/directory.js'
 import { buildIoMap } from '../src/model/iomap.js'
 import { XNodeState } from '../src/model/state.js'
+import { networkDirectory } from './helpers/directory.js'
 import { apply, loadedState } from './fixtures/load.js'
 
 const combo = loadedState('xnode2-combo')
@@ -241,5 +245,103 @@ describe('xpointPickerFields', () => {
 		expect(fields).toHaveLength(5)
 		expect(fields[1].choices).toEqual([])
 		expect(fields[1].default).toBe(1)
+	})
+})
+
+describe('sourceChoices', () => {
+	const known = parseKnownSources('22301=Studio Mic 1\n239.200.1.1=Elsewhere')
+
+	it('known sources only, as the connect dropdown always listed them', () => {
+		expect(sourceChoices(known)).toEqual([
+			{ id: '239.192.87.29', label: '22301 · Studio Mic 1' },
+			{ id: '239.200.1.1', label: '239.200.1.1 · Elsewhere' },
+		])
+		expect(sourceChoices([])).toEqual([])
+		expect(sourceChoices(known, networkDirectory([]))).toEqual(sourceChoices(known))
+	})
+
+	it('discovered sources follow, in channel order: id is the stream address, label shows the device', () => {
+		const choices = sourceChoices([], networkDirectory())
+		expect(choices.slice(0, 3)).toEqual([
+			{ id: '239.192.0.141', label: '141 · Program 1 (Engine402F59)' },
+			{ id: '239.192.0.142', label: '142 · Program 2 (Engine402F59)' },
+			{ id: '239.192.0.143', label: '143 · Program 3 (Engine402F59)' },
+		])
+		const ids = choices.map((c) => c.id)
+		expect(ids).toHaveLength(8 + 8 + 10)
+		expect(new Set(ids).size).toBe(ids.length)
+		expect(choices.find((c) => c.id === '239.192.87.29')).toEqual({
+			id: '239.192.87.29',
+			label: '22301 · MIC 1 (Node-223-0)',
+		})
+		expect(choices.find((c) => c.id === '239.192.87.129')?.label).toBe('22401 · MIX ANIM (Node-224-0)')
+	})
+
+	it("a console's backfeed source is listed under its own address", () => {
+		const choices = sourceChoices([], networkDirectory())
+		expect(choices.find((c) => c.id === '239.193.87.29')).toEqual({
+			id: '239.193.87.29',
+			label: '22301 · To: SRC 1 (Engine402F59)',
+		})
+	})
+
+	it('known sources come first and hide the discovered source with the same address', () => {
+		const choices = sourceChoices(known, networkDirectory())
+		expect(choices.slice(0, 2)).toEqual([
+			{ id: '239.192.87.29', label: '22301 · Studio Mic 1' },
+			{ id: '239.200.1.1', label: '239.200.1.1 · Elsewhere' },
+		])
+		expect(choices.filter((c) => c.id === '239.192.87.29')).toHaveLength(1)
+		expect(choices).toHaveLength(2 + 26 - 1)
+		expect(choices[2].id).toBe('239.192.0.141')
+	})
+
+	it('keeps the directory order', () => {
+		const directory = networkDirectory()
+		const wanted = directory.sources().map((s) => s.streamAddress)
+		expect(sourceChoices([], directory).map((c) => c.id)).toEqual(wanted)
+	})
+
+	describe('edge cases', () => {
+		const source = (over: Partial<DirectorySource>): DirectorySource => ({
+			slot: 'S001',
+			channel: 100,
+			name: 'Mic',
+			streamAddress: '239.192.0.100',
+			backfeedAddress: '239.193.0.100',
+			deviceIp: '10.0.0.1',
+			deviceName: 'Node A',
+			...over,
+		})
+		const fake = (...sources: DirectorySource[]): { sources: () => DirectorySource[] } => ({ sources: () => sources })
+
+		it('a source without a name shows its channel and device', () => {
+			expect(sourceChoices([], fake(source({ name: '' })))).toEqual([{ id: '239.192.0.100', label: '100 · (Node A)' }])
+		})
+
+		it('a source without a stream address cannot be picked', () => {
+			expect(
+				sourceChoices(
+					[],
+					fake(source({ streamAddress: '' }), source({ channel: 101, streamAddress: '239.192.0.101' })),
+				),
+			).toEqual([{ id: '239.192.0.101', label: '101 · Mic (Node A)' }])
+		})
+
+		it('an address advertised twice is offered once', () => {
+			const choices = sourceChoices(
+				[],
+				fake(source({}), source({ name: 'Copy', deviceIp: '10.0.0.2', deviceName: 'Node B' })),
+			)
+			expect(choices).toEqual([{ id: '239.192.0.100', label: '100 · Mic (Node A)' }])
+		})
+
+		it('reads the directory each time it is called', () => {
+			const sources: DirectorySource[] = []
+			const directory = { sources: () => sources }
+			expect(sourceChoices([], directory)).toEqual([])
+			sources.push(source({}))
+			expect(sourceChoices([], directory)).toHaveLength(1)
+		})
 	})
 })

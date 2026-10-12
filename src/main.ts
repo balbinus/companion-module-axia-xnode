@@ -1,7 +1,15 @@
 import { InstanceBase, InstanceStatus, type SomeCompanionConfigField } from '@companion-module/base'
-import { GetConfigFields, type ModuleConfig, type ModuleSecrets, type StoredConfig } from './config.js'
-import { XNodeController, type ControllerStatus } from './device/controller.js'
+import {
+	GetConfigFields,
+	isValidInterfaceIp,
+	type ModuleConfig,
+	type ModuleSecrets,
+	type StoredConfig,
+} from './config.js'
+import { XNodeController, type ControllerStatus, type LogFn } from './device/controller.js'
+import { SourceDiscovery } from './device/discovery.js'
 import { XNodeOperations } from './device/operations.js'
+import type { LivewireDirectory } from './model/directory.js'
 import type { StateChange } from './model/state.js'
 import { UpdateVariableDefinitions, UpdateVariableValues, type VariablesSchema } from './variables.js'
 import { UpgradeScripts } from './upgrades.js'
@@ -45,6 +53,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	config!: ModuleConfig // Setup in init()
 	controller!: XNodeController
 	ops!: XNodeOperations
+	/** Livewire source discovery; absent while it is off in the config or no device is running */
+	discovery: SourceDiscovery | undefined
 
 	private readonly lifecycle = new SerialQueue()
 	/** Set synchronously by destroy(): queued init/configUpdated work then does nothing */
@@ -57,6 +67,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	constructor(internal: unknown) {
 		super(internal)
+	}
+
+	/** The Livewire directory (names of the sources on the network), when discovery is on */
+	get directory(): LivewireDirectory | undefined {
+		return this.discovery?.directory
 	}
 
 	async init(config: StoredConfig, _isFirstInit: boolean, secrets: ModuleSecrets | undefined): Promise<void> {
@@ -118,6 +133,32 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		controller.on('change', (change) => this.queueChange(change))
 		this.running = true
 		controller.start()
+		this.startDiscovery(log)
+	}
+
+	private startDiscovery(log: LogFn): void {
+		if (this.config.discoverSources === false) return
+		let interfaceIp = (this.config.partylineInterface ?? '').trim()
+		if (!isValidInterfaceIp(interfaceIp)) {
+			log('warn', `Invalid Livewire network interface "${interfaceIp}": using the system default`)
+			interfaceIp = ''
+		}
+		const discovery = new SourceDiscovery({ interfaceIp, log })
+		const live = (): boolean => this.running && !this.destroying && this.discovery === discovery
+		discovery.on('sources', () => {
+			if (!live()) return
+			// New dropdown choices and source names; the variable definitions and presets do not depend on them
+			this.updateActions()
+			this.updateFeedbacks()
+			UpdateVariableValues(this, 'all')
+		})
+		discovery.on('usage', () => {
+			if (!live()) return
+			UpdateVariableValues(this, 'all')
+			this.checkFeedbacks('src_in_use')
+		})
+		this.discovery = discovery
+		discovery.start()
 	}
 
 	private async stopDevice(): Promise<void> {
@@ -126,6 +167,8 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		clearTimeout(this.rebuildTimer)
 		this.flushTimer = this.rebuildTimer = undefined
 		this.pending = []
+		const discovery = this.discovery
+		this.discovery = undefined
 		// Let the operations restore running GPO pulses while the connection is still open (bounded).
 		try {
 			await this.ops?.destroy()
@@ -133,6 +176,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			this.log('warn', `Shutdown: ${e instanceof Error ? e.message : String(e)}`)
 		}
 		this.controller?.destroy()
+		await discovery?.stop()
 		clearTimeout(this.flushTimer)
 		clearTimeout(this.rebuildTimer)
 		this.flushTimer = this.rebuildTimer = undefined
