@@ -190,6 +190,7 @@ export function UpdateFeedbacks(self: ModuleInstance): void {
 					label: 'Known or discovered source',
 					choices: knownChoices,
 					default: known[0]?.ip ?? '',
+					allowInvalidValues: true, // discovered sources come and go
 					isVisibleExpression: visibleWhen('target', 'known'),
 				},
 				{

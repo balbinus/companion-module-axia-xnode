@@ -304,6 +304,7 @@ export function UpdateActions(self: ModuleInstance): void {
 					],
 					default: knownSources[0]?.ip ?? CUSTOM_SOURCE,
 					disableAutoExpression: true,
+					allowInvalidValues: true, // discovered sources come and go
 				},
 				{
 					type: 'number',

@@ -35,8 +35,10 @@ export type ModuleConfig = {
 
 export const DEFAULT_PORT = 93
 
-/** Regex.IP that also accepts an empty value */
-const OPTIONAL_IP_REGEX = `/^$|${Regex.IP.slice(1)}`
+/** 0-255 without leading zeros, as `isIpv4` reads it (Regex.IP also takes 01 and 001) */
+const IPV4_OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)'
+/** Empty or a strict dotted IPv4 address: what `isValidInterfaceIp` accepts, without padding spaces */
+const OPTIONAL_IPV4_REGEX = `/^(?:|${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3})$/`
 
 const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/
 
@@ -208,6 +210,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 				'Listens to the Livewire source advertisements (multicast 239.192.255.3, UDP 4001) to name sources. Receive-only: nothing is sent. In Docker, Companion needs host networking.',
 			width: 6,
 			default: true,
+			disableAutoExpression: true, // partylineInterface is shown depending on it
 		},
 		{
 			type: 'textinput',
@@ -215,7 +218,7 @@ export function GetConfigFields(): SomeCompanionConfigField[] {
 			label: 'Livewire network interface IP (optional)',
 			tooltip: 'Local IP address of the network interface connected to the Livewire network. Blank = system default.',
 			width: 6,
-			regex: OPTIONAL_IP_REGEX,
+			regex: OPTIONAL_IPV4_REGEX,
 			default: '',
 			isVisibleExpression: '$(options:discoverSources)',
 		},

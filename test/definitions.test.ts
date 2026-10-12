@@ -391,6 +391,12 @@ describe('source discovery in the definitions', () => {
 			expect(self.actions.dst_connect_channel.description).toMatch(/known or discovered source/)
 		})
 
+		it('accepts a source that is no longer listed (discovered choices come and go)', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateActions(asSelf(self))
+			expect(option(self.actions.dst_connect_channel, 'source')).toMatchObject({ allowInvalidValues: true })
+		})
+
 		it('keeps its definition stable: the default does not depend on what was discovered', () => {
 			const without = fakeSelf('legacy-analog4x4-a')
 			const withDiscovery = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
@@ -447,6 +453,12 @@ describe('source discovery in the definitions', () => {
 			expect(known.label).toBe('Known or discovered source')
 			expect(known.choices).toHaveLength(2 + 25)
 			expect(known.choices[2]).toEqual({ id: '239.192.0.141', label: '141 · Program 1 (Engine402F59)' })
+		})
+
+		it('accepts a source that is no longer listed (discovered choices come and go)', () => {
+			const { self } = fakeSelf('legacy-analog4x4-a', true, networkDirectory())
+			UpdateFeedbacks(asSelf(self))
+			expect(option(self.feedbacks.dst_connected_to, 'known')).toMatchObject({ allowInvalidValues: true })
 		})
 
 		it('keeps its defaults independent of discovery', () => {
